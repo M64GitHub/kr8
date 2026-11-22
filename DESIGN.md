@@ -5,7 +5,7 @@ browser for a tracker live set (2× M8, Game Boy/LSDj, DUET). Browse, audition w
 find across folders, copy into a set, cut loops out of long samples. Zig 0.15.2 on movy (v0.3.1,
 pinned like qartz). macOS first; keep Linux building (bbox).
 
-Status (2026-11-22): **steps 1-5 built** (browse + listen, copy, the library, find, the detail
+Repo: github.com/M64GitHub/kr8 (private, GPL-3.0). Status (2026-11-22): **steps 1-5 built** (browse + listen, copy, the library, find, the detail
 view): `kr8 [DIR...]`, linked as `~/bin/kr8`. Next: step 6 (the extras pool).
 
 ## 1. The library (scanned 2026-11-22)
