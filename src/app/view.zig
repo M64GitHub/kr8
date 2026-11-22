@@ -153,6 +153,8 @@ pub const Ctx = struct {
     /// the find prompt: matches so far (-1 = none / invalid), or the problem
     find_count: i64,
     find_msg: []const u8,
+    /// the find prompt's text is selected (typing replaces it)
+    input_sel: bool,
     export_n: usize,
     export_to: usize,
     cfg: *const config.Config,
@@ -655,12 +657,16 @@ const FIND_HELP = [_][]const u8{
 /// The search prompt: the query, the live count, the syntax.
 fn drawFind(c: *TextCanvas, ctx: *const Ctx) void {
     const w: usize = @min(ctx.lay.cols -| 4, 86);
-    const h: usize = FIND_HELP.len + 7;
+    const no_roots = if (ctx.lib) |lib| lib.roots.items.len == 0 else false;
+    const h: usize = FIND_HELP.len + 7 + @as(usize, if (no_roots) 2 else 0);
     const x0 = (ctx.lay.cols -| w) / 2;
     const y0 = (ctx.lay.rows -| h) / 2;
     widgets.frame(c, x0, y0, w, h, " FIND IN THE LIBRARY ");
     c.put(x0 + 3, y0 + 2, 0x276F, theme.accent_hot, theme.bg);
-    const n = textTail(c, x0 + 5, y0 + 2, ctx.input, w -| 24, theme.text_bright, theme.bg);
+    // a selected (pre-filled) query is drawn inverted: typing replaces it
+    const qfg = if (ctx.input_sel) theme.cursor_fg else theme.text_bright;
+    const qbg = if (ctx.input_sel) theme.cursor_bg else theme.bg;
+    const n = textTail(c, x0 + 5, y0 + 2, ctx.input, w -| 24, qfg, qbg);
     c.put(x0 + 5 + n, y0 + 2, 0x2588, theme.accent_hot, theme.bg);
     var cb: [40]u8 = undefined;
     const cs = if (ctx.find_msg.len > 0)
@@ -675,7 +681,13 @@ fn drawFind(c: *TextCanvas, ctx: *const Ctx) void {
     } else c.putStr(x0 + w -| (cs.len + 3), y0 + 2, cs, col, theme.bg);
     c.putRepeat(x0 + 2, y0 + 4, w - 4, 0x2500, theme.sep, theme.bg);
     for (FIND_HELP, 0..) |line, i| _ = text(c, x0 + 3, y0 + 5 + i, line, w -| 6, theme.text_dim, theme.bg);
-    c.putStr(x0 + 2, y0 + h - 1, " enter searches (this pane shows the hits)  esc ", theme.text_dim, theme.bg);
+    if (ctx.lib) |lib| if (lib.roots.items.len == 0) {
+        // an empty library is not a broken search: say what is in it
+        _ = text(c, x0 + 3, y0 + 5 + FIND_HELP.len, "no folder is indexed yet - only files you tagged are searched.", w -| 6, theme.accent_pink, theme.bg);
+        _ = text(c, x0 + 3, y0 + 6 + FIND_HELP.len, "in a shell: kr8 root add ~/TRACKBASE/samples/trackers", w -| 6, theme.accent_pink, theme.bg);
+    };
+    const hint = if (ctx.input_sel) " typing replaces the old search, right keeps it  esc " else " enter searches (this pane shows the hits)  esc ";
+    c.putStr(x0 + 2, y0 + h - 1, hint, theme.text_dim, theme.bg);
 }
 
 fn drawExport(c: *TextCanvas, ctx: *const Ctx) void {

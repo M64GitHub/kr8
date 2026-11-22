@@ -129,6 +129,9 @@ const App = struct {
     // the find prompt: live match count, or what is wrong with the query
     find_count: i64 = -1,
     find_msg: []const u8 = "",
+    /// the pre-filled query is SELECTED: typing replaces it (m64 typed
+    /// is:stereo after a search for is:mono and got "is:mono is:stereo")
+    input_sel: bool = false,
     // the export confirmation
     export_n: usize = 0,
     export_to: usize = 0,
@@ -391,6 +394,7 @@ fn viewCtx(app: *App, lay: *const view.Layout) view.Ctx {
         },
         .note_title = app.note_title[0..app.note_title_len],
         .find_count = app.find_count,
+        .input_sel = app.input_sel,
         .find_msg = app.find_msg,
         .export_n = app.export_n,
         .export_to = app.export_to,
@@ -1298,6 +1302,7 @@ fn openFind(app: *App) void {
     const q = if (p.isQuery()) p.query() else "";
     @memcpy(app.input_buf[0..q.len], q);
     app.input_len = q.len;
+    app.input_sel = q.len > 0;
     updateFindCount(app);
     app.modal = .find;
 }
@@ -1333,7 +1338,14 @@ fn findKey(app: *App, k: Key) void {
                 app.setStatus("{d}+ files - the first {d}; add words to narrow it", .{ p.rows(), library.FIND_LIMIT });
             } else app.setStatus("{d} files - backspace returns to the folder, o opens a file's folder", .{p.rows()});
         },
+        .Right, .End => app.input_sel = false, // keep the old search, edit it
         else => {
+            if (app.input_sel) {
+                // a selected query is replaced by typing, cleared by backspace
+                app.input_sel = false;
+                if (k.type == .Char or k.type == .Backspace) app.input_len = 0;
+                if (k.type == .Backspace) return updateFindCount(app);
+            }
             editText(&app.input_buf, &app.input_len, k);
             updateFindCount(app);
         },
