@@ -149,4 +149,4 @@ is [SQLite](https://sqlite.org) (public domain).
 
 ## License
 
-See [LICENSE](LICENSE).
+GPL-3.0-or-later, like [qartz](https://github.com/M64GitHub/qartz). See [LICENSE](LICENSE).
