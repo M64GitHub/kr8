@@ -1,0 +1,19 @@
+.{
+    .name = .kr8,
+    .version = "0.1.0",
+    .fingerprint = 0x8ec85e39d3be5718,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // movy, the terminal render engine (M64GitHub/movy), the same
+        // release DUET and qartz pin - the UI kit lifted from them builds on it
+        .movy = .{
+            .url = "https://github.com/M64GitHub/movy/archive/refs/tags/v0.3.1.tar.gz",
+            .hash = "movy-0.3.1-UtRV61KlDgCcAPuKtHhTsOXuNPwlQDGr-bXkq9JDkVRB",
+        },
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip",
+            .hash = "N-V-__8AAHCbqABM_X5RTjbDBDBWErxZE8tJzmtEnLOLRHGx",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "vendor" },
+}
