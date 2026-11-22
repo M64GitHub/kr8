@@ -1,5 +1,5 @@
 #!/bin/zsh
-# The REAL look: run kr8 in a new kitty window (silent: --volume 0, a
+# The REAL look: run kr8 in a new kitty window (silent: --silent, a
 # scratch KR8_HOME), screenshot it, print kr8's and kitty's CPU, close it.
 #
 #   tools/look.sh OUT.png SECONDS "KEYS" DIR...
@@ -13,7 +13,7 @@ here=${0:A:h:h}
 home=${KR8_LOOK_HOME:-${TMPDIR:-/tmp}kr8-look-home}
 mkdir -p $home
 title="kr8look$$"
-KR8_HOME=$home kitty --title $title $here/zig-out/bin/kr8 --volume 0 --keys "$keys" "$@" &
+KR8_HOME=$home kitty --title $title $here/zig-out/bin/kr8 --silent --keys "$keys" "$@" &
 kpid=$!
 sleep $secs
 kp=$(pgrep -f "^$here/zig-out/bin/kr8" | head -1)

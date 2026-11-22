@@ -26,6 +26,7 @@ const USAGE =
     \\  DIR ...           open a pane per folder (max 4); none = last session
     \\  --no-audio        don't open the audio device
     \\  --volume 0-100    start at this preview volume (- + change it)
+    \\  --silent          play without sound (tests, screenshots)
     \\  --scheme NAME     colour scheme (T cycles them in the app)
     \\  -V, --version
     \\  -h, --help
@@ -68,6 +69,8 @@ pub fn main() !u8 {
         const a = args[i];
         if (std.mem.eql(u8, a, "--no-audio")) {
             opts.no_audio = true;
+        } else if (std.mem.eql(u8, a, "--silent")) {
+            opts.silent = true;
         } else if (std.mem.eql(u8, a, "--volume")) {
             i += 1;
             if (i >= args.len) return usage("--volume needs 0-100");

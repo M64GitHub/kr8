@@ -55,6 +55,8 @@ pub const Options = struct {
     keys: []const u8 = "",
     no_audio: bool = false,
     volume: f32 = 1.0,
+    /// play without sound, the UI none the wiser (tests, screenshots)
+    silent: bool = false,
     scheme: ?[]const u8 = null,
     dirs: []const []const u8 = &.{},
 };
@@ -72,6 +74,7 @@ const App = struct {
     frame_no: u64 = 0,
     volume: f32 = 1.0,
     headless: bool = false,
+    silent: bool = false,
     /// list rows of the focused pane, as last drawn (PgUp/PgDn)
     page_rows: usize = 15,
     /// something on screen changed: draw this frame (idle frames draw
@@ -241,6 +244,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
         .peaks_view = peaks_view,
         .copier = copier,
         .headless = opts.headless,
+        .silent = opts.silent,
     };
     for (&app.panes) |*p| p.* = .{ .gpa = gpa };
     if (std.posix.getenv("HOME")) |h| {
@@ -285,7 +289,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
 
     motion.settled = opts.headless;
     app.volume = opts.volume;
-    audio.setVolume(app.volume);
+    audio.setVolume(if (opts.silent) 0 else app.volume);
     if (!audio.enabled and !opts.headless) app.setStatus("no audio device - browsing only", .{});
 
     // the pixel layer is a plain ground today: composite it once (and on a
@@ -740,7 +744,7 @@ fn mainKey(app: *App, k: Key) void {
 
 fn setVolume(app: *App, v: f32) void {
     app.volume = std.math.clamp(@round(v * 10) / 10, 0.0, 1.0);
-    audio.setVolume(app.volume);
+    if (!app.silent) audio.setVolume(app.volume);
     app.setStatus("preview volume {d}%", .{@as(u32, @intFromFloat(app.volume * 100 + 0.5))});
 }
 
