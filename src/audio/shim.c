@@ -37,6 +37,7 @@ typedef struct {
     int retiring; /* fading out after a stop */
 } Voice;
 
+static ma_resource_manager g_rm;
 static ma_engine g_engine;
 static int g_engine_ok = 0;
 static Voice g_voice[2];
@@ -54,11 +55,26 @@ static void voice_free(Voice *v)
 int kr8_audio_init(void)
 {
     ma_engine_config cfg;
+    ma_resource_manager_config rmc;
     if (g_engine_ok)
         return 0;
-    cfg = ma_engine_config_init();
-    if (ma_engine_init(&cfg, &g_engine) != MA_SUCCESS)
+    /* Decode at each file's OWN rate (the engine converts to the device
+     * rate at the end). The default resource manager decodes at the
+     * device rate, and then a stream's cursor, length and loop points are
+     * all counted in 48 kHz frames on a 48 kHz Mac - the playhead ran 9 %
+     * fast on every 44.1 kHz file. */
+    rmc = ma_resource_manager_config_init();
+    rmc.decodedFormat = ma_format_f32;
+    rmc.decodedChannels = 0;
+    rmc.decodedSampleRate = 0;
+    if (ma_resource_manager_init(&rmc, &g_rm) != MA_SUCCESS)
         return -1;
+    cfg = ma_engine_config_init();
+    cfg.pResourceManager = &g_rm;
+    if (ma_engine_init(&cfg, &g_engine) != MA_SUCCESS) {
+        ma_resource_manager_uninit(&g_rm);
+        return -1;
+    }
     g_engine_ok = 1;
     return 0;
 }
@@ -70,6 +86,7 @@ void kr8_audio_uninit(void)
     g_cur = -1;
     if (g_engine_ok) {
         ma_engine_uninit(&g_engine);
+        ma_resource_manager_uninit(&g_rm);
         g_engine_ok = 0;
     }
 }

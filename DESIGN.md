@@ -5,8 +5,8 @@ browser for a tracker live set (2× M8, Game Boy/LSDj, DUET). Browse, audition w
 find across folders, copy into a set, cut loops out of long samples. Zig 0.15.2 on movy (v0.3.1,
 pinned like qartz). macOS first; keep Linux building (bbox).
 
-Status (2026-11-22): **steps 1-3 built** (browse + listen, copy, the library: scan, fingerprints,
-tags, notes): `kr8 [DIR...]`, linked as `~/bin/kr8`. Next: step 4 (find: query panes, export).
+Status (2026-11-22): **steps 1-4 built** (browse + listen, copy, the library, find): `kr8 [DIR...]`,
+linked as `~/bin/kr8`. Next: step 5 (the detail view: waveform zoom, range, loop, write WAV).
 
 ## 1. The library (scanned 2026-11-22)
 
@@ -128,15 +128,17 @@ remembers (saved in the config). Name collisions get `_2`, `_3`. Built as specif
 4. **Cut a loop**: `Enter` on a long sample, set in/out, snap to zero, `L`, `w` writes it next to the
    target pane.
 
-## 6. Search syntax (draft)
+## 6. Search syntax (built, step 4)
 
 `f kick dark -used <1s`
 
-- bare word: file name, tag or note contains it (case-insensitive); `-word` negates
+- bare word: the PATH (folders + file name, relative to its root), a tag or the note contains it
+  (case-insensitive substring - exact, never fuzzy); `-word` negates. Folder names count because
+  packs sort by folder (`kick` finds `Techstep Kicks/BD_01.wav`) - so `in:` was dropped.
 - `#tag`: exactly this tag; `-#tag`
 - `<1s` `>2s` `<500ms`: duration
-- `is:loop` (smpl loop) · `is:wavetable` · `is:dupe` · `is:mono` · `is:stereo` · `is:untagged` · `is:lost`
-- `in:Breaks`: path contains
+- `is:dupe` · `is:mono` · `is:stereo` · `is:tagged` · `is:untagged` · `is:noted` · `is:loop` ·
+  `is:wavetable` (`is:lost` dropped: a lost sound has no file to list)
 
 ## 7. Data model
 
@@ -196,7 +198,14 @@ the target pane's folder; tags copied). Shows range length and a BPM guess for 1
      the picker opens), `e` one-line note. Targets = the pane's marks, else the cursor WAV. Rows: tags
      (green), `×N` copies, `¶` note; a second info row: tags · copies · note. Folders show their
      WAV/folder counts in the info row.
-4. **Find**: query panes, search syntax, saved queries as favorites, export.
+4. ~~**Find**: query panes, search syntax, saved queries as favorites, export.~~ Done 2026-11-22:
+   `f` turns the focused pane into a SEARCH PANE (live match count while typing; at most 5000 hits),
+   hits show their folder dim; `bksp` returns to the folder (after a restart: the first root), `o`
+   opens a hit's folder, `r` searches again, `E` exports everything shown (confirm). Searches are
+   PLACES (`?query`): favorites and the session store them like folders. A search pane is never a
+   copy destination. Also fixed: miniaudio's resource manager decoded at the DEVICE rate, so the
+   playhead/readout ran 9 % fast on 44.1 kHz files at a 48 kHz Mac (and smpl loop points would have
+   been off) - now it decodes at the file's own rate (regression test in audio.zig).
 5. **Detail view**: waveform zoom, range, snap, loop, write WAV.
 6. Later: BPM from names, `kr8 find|export` CLI, `.pti` preview, LSDj kit builder, M8 slice points.
 

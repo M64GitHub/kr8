@@ -85,3 +85,41 @@ pub fn peaks(path: [:0]const u8, mins: []f32, maxs: []f32, frames: *u64, cancel:
         else => .failed,
     };
 }
+
+// ------------------------------------------------------------------ tests
+
+test "playback counts in the file's own frames (not the device's)" {
+    if (!init()) return error.SkipZigTest; // no audio device here
+    defer deinit();
+    setVolume(0); // silent
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a 44.1 kHz mono 16-bit wav, 0.5 s
+    const frames: u32 = 22050;
+    var f = try tmp.dir.createFile("t.wav", .{});
+    var buf: [4096]u8 = undefined;
+    var w = f.writer(&buf);
+    const io = &w.interface;
+    try io.writeAll("RIFF");
+    try io.writeInt(u32, 36 + frames * 2, .little);
+    try io.writeAll("WAVEfmt ");
+    try io.writeInt(u32, 16, .little);
+    try io.writeInt(u16, 1, .little);
+    try io.writeInt(u16, 1, .little);
+    try io.writeInt(u32, 44100, .little);
+    try io.writeInt(u32, 88200, .little);
+    try io.writeInt(u16, 2, .little);
+    try io.writeInt(u16, 16, .little);
+    try io.writeAll("data");
+    try io.writeInt(u32, frames * 2, .little);
+    for (0..frames) |i| try io.writeInt(i16, @intCast(@mod(@as(i32, @intCast(i)) * 300, 20000)), .little);
+    try io.flush();
+    f.close();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &pb);
+    var zb: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&zb, "{s}/t.wav", .{dir});
+    try std.testing.expect(play(path, false, .{}));
+    defer stop();
+    try std.testing.expectEqual(@as(u64, frames), length());
+}

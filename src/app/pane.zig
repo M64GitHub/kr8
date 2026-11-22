@@ -10,6 +10,9 @@
 //! - WAV headers are read lazily (`info`), only for rows that get looked at.
 //! - MARKS (`v`, `V`) live on the entries; a reload keeps them by name,
 //!   a new folder starts unmarked.
+//! - A SEARCH PANE (`showResults`) lists library hits from anywhere: its
+//!   entries' names are ABSOLUTE paths, `dir()` is "" (it is no folder),
+//!   and it remembers the folder it was opened from (`backDir`).
 
 const std = @import("std");
 const wav = @import("../audio/wav.zig");
@@ -17,6 +20,9 @@ const library = @import("../db/library.zig");
 
 pub const PATH_MAX = std.fs.max_path_bytes;
 pub const FILTER_MAX = 48;
+pub const QUERY_MAX = 200;
+
+pub const Mode = enum { dir, query };
 
 pub const Kind = enum { parent, dir, audio, other };
 
@@ -54,6 +60,14 @@ pub const Pane = struct {
     filter_len: usize = 0,
     /// typing into the filter line right now
     typing: bool = false,
+    mode: Mode = .dir,
+    query_buf: [QUERY_MAX]u8 = undefined,
+    query_len: usize = 0,
+    /// the folder a search pane goes back to
+    back_buf: [PATH_MAX]u8 = undefined,
+    back_len: usize = 0,
+    /// the search hit FIND_LIMIT
+    truncated: bool = false,
     err: ?anyerror = null,
 
     pub fn deinit(self: *Pane) void {
@@ -76,6 +90,50 @@ pub const Pane = struct {
         return self.filter_buf[0..self.filter_len];
     }
 
+    pub fn isQuery(self: *const Pane) bool {
+        return self.mode == .query;
+    }
+
+    pub fn query(self: *const Pane) []const u8 {
+        return self.query_buf[0..self.query_len];
+    }
+
+    pub fn backDir(self: *const Pane) []const u8 {
+        return self.back_buf[0..self.back_len];
+    }
+
+    /// What a row shows as the name (a search hit: the file name only).
+    pub fn displayName(self: *const Pane, e: *const Entry) []const u8 {
+        return if (self.mode == .query) std.fs.path.basename(e.name) else e.name;
+    }
+
+    /// Turn the pane into a SEARCH PANE showing `paths` (absolute; copied).
+    pub fn showResults(self: *Pane, q: []const u8, paths: []const []const u8, truncated: bool) !void {
+        if (self.mode == .dir and self.dir_len > 0) {
+            @memcpy(self.back_buf[0..self.dir_len], self.dir());
+            self.back_len = self.dir_len;
+        }
+        self.clearEntries();
+        self.mode = .query;
+        self.dir_len = 0;
+        const n = @min(q.len, QUERY_MAX);
+        @memcpy(self.query_buf[0..n], q[0..n]);
+        self.query_len = n;
+        self.truncated = truncated;
+        for (paths) |path| {
+            try self.entries.append(self.gpa, .{
+                .name = try self.gpa.dupe(u8, path),
+                .kind = if (isAudioName(path)) .audio else .other,
+            });
+        }
+        std.mem.sort(Entry, self.entries.items, {}, entryLess);
+        self.filter_len = 0;
+        self.typing = false;
+        try self.refilter();
+        self.cursor = 0;
+        self.scroll = 0;
+    }
+
     /// Open `path` (made absolute and normalised). On failure the pane
     /// keeps its folder and the error is returned.
     pub fn open(self: *Pane, path: []const u8, reselect: ?[]const u8) !void {
@@ -88,6 +146,8 @@ pub const Pane = struct {
         @memcpy(self.dir_buf[0..abs.len], abs);
         self.dir_len = abs.len;
         self.err = null;
+        self.mode = .dir;
+        self.truncated = false;
 
         if (!std.mem.eql(u8, abs, "/"))
             try self.entries.append(self.gpa, .{ .name = try self.gpa.dupe(u8, ""), .kind = .parent });
@@ -186,6 +246,7 @@ pub const Pane = struct {
 
     /// `dir/name` into `buf`, NUL-terminated (for the C side).
     pub fn pathOf(self: *const Pane, e: *const Entry, buf: *[PATH_MAX + 1]u8) ?[:0]const u8 {
+        if (self.mode == .query) return std.fmt.bufPrintZ(buf, "{s}", .{e.name}) catch null;
         const d = self.dir();
         const sep: []const u8 = if (std.mem.endsWith(u8, d, "/")) "" else "/";
         const s = std.fmt.bufPrintZ(buf, "{s}{s}{s}", .{ d, sep, e.name }) catch return null;

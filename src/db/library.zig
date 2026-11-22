@@ -575,6 +575,15 @@ pub const Library = struct {
 
     // ---------------------------------------------------- numbers
 
+    /// Search the library (syntax: see `termSql`).
+    pub fn find(self: *Library, gpa: std.mem.Allocator, query: []const u8) !Found {
+        return libFind(self, gpa, query);
+    }
+
+    pub fn findCount(self: *Library, gpa: std.mem.Allocator, query: []const u8) !i64 {
+        return libFindCount(self, gpa, query);
+    }
+
     pub const Stats = struct { sounds: i64 = 0, files: i64 = 0, dupe_sounds: i64 = 0, tagged: i64 = 0, tags: i64 = 0 };
 
     pub fn stats(self: *Library) Stats {
@@ -596,6 +605,152 @@ pub const Library = struct {
     }
 };
 
+// ------------------------------------------------------------ find
+
+pub const FIND_LIMIT = 5000;
+
+pub const FindError = error{ EmptyQuery, UnknownIs, BadLength };
+
+const Bind = union(enum) { text: []const u8, int: i64 };
+
+/// One search term as SQL over `file f JOIN sound s` (see `find`).
+/// Words are matched EXACTLY (a case-insensitive substring), never fuzzy.
+fn termSql(tok: []const u8, sql: *std.ArrayList(u8), binds: *std.ArrayList(Bind), gpa: std.mem.Allocator, lower: []u8) !void {
+    var t = tok;
+    var neg = false;
+    if (t.len > 1 and t[0] == '-') {
+        neg = true;
+        t = t[1..];
+    }
+    const n = binds.items.len + 1; // this term's ?N
+    var w = sql.writer(gpa);
+    if (t[0] == '#' and t.len > 1) {
+        var tb: [TAG_MAX]u8 = undefined;
+        const name = Library.normTag(t[1..], &tb);
+        const owned = lower[0..name.len];
+        @memcpy(owned, name);
+        try binds.append(gpa, .{ .text = owned });
+        try w.print("{s}EXISTS(SELECT 1 FROM sound_tag st JOIN tag t ON t.id = st.tag_id " ++
+            "WHERE st.sound_id = f.sound_id AND t.name = ?{d})", .{ if (neg) "NOT " else "", n });
+        return;
+    }
+    if (t[0] == '<' or t[0] == '>') {
+        var num = t[1..];
+        var mul: f64 = 1000; // seconds by default
+        if (std.mem.endsWith(u8, num, "ms")) {
+            num = num[0 .. num.len - 2];
+            mul = 1;
+        } else if (std.mem.endsWith(u8, num, "s")) num = num[0 .. num.len - 1];
+        const v = std.fmt.parseFloat(f64, num) catch return error.BadLength;
+        try binds.append(gpa, .{ .int = @intFromFloat(v * mul) });
+        try w.print("(s.rate > 0 AND s.frames * 1000 / s.rate {s} ?{d})", .{ t[0..1], n });
+        return;
+    }
+    if (std.mem.startsWith(u8, t, "is:")) {
+        const k = t[3..];
+        const frag: []const u8 = if (std.mem.eql(u8, k, "dupe"))
+            "(SELECT COUNT(*) FROM file f2 WHERE f2.sound_id = f.sound_id) > 1"
+        else if (std.mem.eql(u8, k, "mono"))
+            "s.channels = 1"
+        else if (std.mem.eql(u8, k, "stereo"))
+            "s.channels = 2"
+        else if (std.mem.eql(u8, k, "loop"))
+            "s.loop_end > s.loop_start"
+        else if (std.mem.eql(u8, k, "wavetable"))
+            "(s.flags & 1) != 0"
+        else if (std.mem.eql(u8, k, "tagged"))
+            "EXISTS(SELECT 1 FROM sound_tag st WHERE st.sound_id = f.sound_id)"
+        else if (std.mem.eql(u8, k, "untagged"))
+            "NOT EXISTS(SELECT 1 FROM sound_tag st WHERE st.sound_id = f.sound_id)"
+        else if (std.mem.eql(u8, k, "noted"))
+            "EXISTS(SELECT 1 FROM note nt WHERE nt.sound_id = f.sound_id)"
+        else
+            return error.UnknownIs;
+        try w.print("{s}({s})", .{ if (neg) "NOT " else "", frag });
+        return;
+    }
+    // a word: the path (folders + name), a tag or the note contains it
+    const owned = lower[0..t.len];
+    for (t, 0..) |ch, i| owned[i] = std.ascii.toLower(ch);
+    try binds.append(gpa, .{ .text = owned });
+    try w.print("{s}(instr(lower(f.path), ?{d}) > 0" ++
+        " OR EXISTS(SELECT 1 FROM sound_tag st JOIN tag t ON t.id = st.tag_id" ++
+        " WHERE st.sound_id = f.sound_id AND instr(lower(t.name), ?{d}) > 0)" ++
+        " OR EXISTS(SELECT 1 FROM note nt WHERE nt.sound_id = f.sound_id AND instr(lower(nt.text), ?{d}) > 0))", .{ if (neg) "NOT " else "", n, n, n });
+}
+
+/// The query as a prepared statement: `head` + WHERE every term.
+fn findStmt(self: *Library, gpa: std.mem.Allocator, query: []const u8, head: []const u8, tail: []const u8, scratch: []u8) !sqlite.Stmt {
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(gpa);
+    var binds: std.ArrayList(Bind) = .empty;
+    defer binds.deinit(gpa);
+    try sql.appendSlice(gpa, head);
+    try sql.appendSlice(gpa, " WHERE 1");
+    var it = std.mem.tokenizeScalar(u8, query, ' ');
+    var used: usize = 0;
+    var terms: usize = 0;
+    while (it.next()) |tok| {
+        if (used + tok.len > scratch.len) break;
+        try sql.appendSlice(gpa, " AND ");
+        try termSql(tok, &sql, &binds, gpa, scratch[used..]);
+        used += tok.len;
+        terms += 1;
+    }
+    if (terms == 0) return error.EmptyQuery;
+    try sql.appendSlice(gpa, tail);
+    try sql.append(gpa, 0);
+    var st = try self.db.prepare(sql.items[0 .. sql.items.len - 1 :0]);
+    errdefer st.deinit();
+    for (binds.items, 0..) |b, i| switch (b) {
+        .text => |v| try st.bindText(@intCast(i + 1), v),
+        .int => |v| try st.bindInt(@intCast(i + 1), v),
+    };
+    return st;
+}
+
+const FIND_HEAD = "FROM file f JOIN sound s ON s.id = f.sound_id LEFT JOIN root r ON r.id = f.root_id";
+
+/// How many files match (the FIND prompt counts as you type).
+fn libFindCount(self: *Library, gpa: std.mem.Allocator, query: []const u8) !i64 {
+    var scratch: [512]u8 = undefined;
+    var st = try findStmt(self, gpa, query, "SELECT COUNT(*) " ++ FIND_HEAD, "", &scratch);
+    defer st.deinit();
+    if (!try st.step()) return 0;
+    return st.int(0);
+}
+
+pub const Found = struct {
+    paths: [][]u8,
+    truncated: bool,
+
+    pub fn deinit(self: *Found, gpa: std.mem.Allocator) void {
+        for (self.paths) |p| gpa.free(p);
+        gpa.free(self.paths);
+    }
+};
+
+/// Every matching file as an absolute path (at most FIND_LIMIT).
+fn libFind(self: *Library, gpa: std.mem.Allocator, query: []const u8) !Found {
+    var scratch: [512]u8 = undefined;
+    var st = try findStmt(self, gpa, query, "SELECT CASE WHEN f.root_id = 0 THEN f.path ELSE r.path || '/' || f.path END " ++ FIND_HEAD, std.fmt.comptimePrint(" LIMIT {d}", .{FIND_LIMIT + 1}), &scratch);
+    defer st.deinit();
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |p| gpa.free(p);
+        out.deinit(gpa);
+    }
+    var truncated = false;
+    while (try st.step()) {
+        if (out.items.len >= FIND_LIMIT) {
+            truncated = true;
+            break;
+        }
+        try out.append(gpa, try gpa.dupe(u8, st.text(0)));
+    }
+    return .{ .paths = try out.toOwnedSlice(gpa), .truncated = truncated };
+}
+
 // ------------------------------------------------------------------ tests
 
 test "placeIn and isWithin" {
@@ -607,6 +762,41 @@ test "placeIn and isWithin" {
     try std.testing.expectEqual(@as(i64, 0), placeIn(&roots, "/s/trackers2/x.wav").root_id);
     try std.testing.expect(isWithin("/s/trackers/x", "/s"));
     try std.testing.expect(!isWithin("/s2", "/s"));
+}
+
+test "find: words, tags, lengths, is:" {
+    const gpa = std.testing.allocator;
+    const lib = try Library.open(gpa, ":memory:");
+    defer lib.close();
+    try lib.db.exec(
+        \\INSERT INTO root(id, path) VALUES(1, '/lib');
+        \\INSERT INTO sound(id, dlen, dhash, frames, rate, channels, flags) VALUES
+        \\  (1, 10, 1, 22050, 44100, 1, 0), (2, 20, 2, 441000, 44100, 2, 0), (3, 30, 3, 4410, 44100, 1, 1);
+        \\INSERT INTO file(root_id, path, sound_id) VALUES
+        \\  (1, 'Techstep Kicks/BD_01.wav', 1), (1, 'Breaks/Amen.wav', 2),
+        \\  (1, 'copies/BD_01.wav', 1), (0, '/elsewhere/wt.wav', 3);
+        \\INSERT INTO tag(id, name) VALUES(1, 'good');
+        \\INSERT INTO sound_tag(sound_id, tag_id) VALUES(2, 1);
+        \\INSERT INTO note(sound_id, text) VALUES(3, 'Serum table');
+    );
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, "kick")); // the folder name counts
+    try std.testing.expectEqual(@as(i64, 2), try lib.findCount(gpa, "bd_01"));
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, "#good"));
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, "good")); // a word finds tags too
+    try std.testing.expectEqual(@as(i64, 0), try lib.findCount(gpa, "good -#good"));
+    try std.testing.expectEqual(@as(i64, 3), try lib.findCount(gpa, "<1s"));
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, ">2s"));
+    try std.testing.expectEqual(@as(i64, 2), try lib.findCount(gpa, "is:dupe"));
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, "serum is:wavetable"));
+    try std.testing.expectEqual(@as(i64, 1), try lib.findCount(gpa, "bd -copies"));
+    try std.testing.expectError(error.UnknownIs, lib.findCount(gpa, "is:nope"));
+    try std.testing.expectError(error.EmptyQuery, lib.findCount(gpa, "  "));
+    var f = try lib.find(gpa, "amen");
+    defer f.deinit(gpa);
+    try std.testing.expectEqualStrings("/lib/Breaks/Amen.wav", f.paths[0]);
+    var g = try lib.find(gpa, "wt");
+    defer g.deinit(gpa);
+    try std.testing.expectEqualStrings("/elsewhere/wt.wav", g.paths[0]); // loose: absolute
 }
 
 test "normTag" {

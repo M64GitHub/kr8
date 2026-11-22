@@ -128,6 +128,7 @@ fn usage(msg: []const u8) u8 {
 
 test {
     _ = @import("audio/wav.zig");
+    _ = @import("audio/audio.zig");
     _ = @import("app/pane.zig");
     _ = @import("app/copier.zig");
     _ = @import("db/library.zig");

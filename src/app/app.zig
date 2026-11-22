@@ -85,7 +85,6 @@ const App = struct {
     playing: bool = false,
     play_buf: [PATH_MAX + 1]u8 = undefined,
     play_len: usize = 0,
-    play_dir_len: usize = 0,
     play_frames: u64 = 0,
     play_rate: u32 = 0,
 
@@ -127,6 +126,12 @@ const App = struct {
     tag_sel: usize = 0,
     tag_title: [160]u8 = undefined,
     tag_title_len: usize = 0,
+    // the find prompt: live match count, or what is wrong with the query
+    find_count: i64 = -1,
+    find_msg: []const u8 = "",
+    // the export confirmation
+    export_n: usize = 0,
+    export_to: usize = 0,
     // the note prompt
     note_sound: i64 = 0,
     note_title: [160]u8 = undefined,
@@ -174,17 +179,15 @@ const App = struct {
         if (self.cfg.armed == null or !std.mem.eql(u8, self.cfg.armed.?, name)) self.cfg.setArmed(name);
     }
 
-    fn playDir(self: *const App) []const u8 {
-        return self.play_buf[0..self.play_dir_len];
-    }
-
-    fn playName(self: *const App) []const u8 {
-        const start = @min(self.play_dir_len + 1, self.play_len);
-        return self.play_buf[start..self.play_len];
+    fn playPath(self: *const App) []const u8 {
+        return self.play_buf[0..self.play_len];
     }
 
     fn isPlayingEntry(self: *const App, p: *const Pane, e: *const pane_mod.Entry) bool {
-        return self.playing and std.mem.eql(u8, self.playDir(), p.dir()) and std.mem.eql(u8, self.playName(), e.name);
+        if (!self.playing) return false;
+        var buf: [PATH_MAX + 1]u8 = undefined;
+        const path = p.pathOf(e, &buf) orelse return false;
+        return std.mem.eql(u8, path, self.playPath());
     }
 
     fn deinit(self: *App) void {
@@ -358,8 +361,7 @@ fn viewCtx(app: *App, lay: *const view.Layout) view.Ctx {
         .status_fade = app.statusFade(),
         .play = .{
             .active = app.playing,
-            .dir = app.playDir(),
-            .name = app.playName(),
+            .path = app.playPath(),
             .pos = audio.cursor(),
             .frames = app.play_frames,
             .rate = app.play_rate,
@@ -388,9 +390,38 @@ fn viewCtx(app: *App, lay: *const view.Layout) view.Ctx {
             .new_name = app.tag_new[0..app.tag_new_len],
         },
         .note_title = app.note_title[0..app.note_title_len],
+        .find_count = app.find_count,
+        .find_msg = app.find_msg,
+        .export_n = app.export_n,
+        .export_to = app.export_to,
         .cfg = app.cfg,
         .home = app.home_buf[0..app.home_len],
     };
+}
+
+/// A PLACE is what a pane shows, as one string: a folder, or `?query`
+/// for a search pane (the config's panes and favorites hold places).
+fn placeOf(p: *const Pane, buf: []u8) []const u8 {
+    if (p.isQuery()) return std.fmt.bufPrint(buf, "?{s}", .{p.query()}) catch "";
+    return p.dir();
+}
+
+fn openPlace(app: *App, p: *Pane, place: []const u8) !void {
+    if (place.len > 0 and place[0] == '?') return runQuery(app, p, place[1..]);
+    var buf: [PATH_MAX]u8 = undefined;
+    const n = @min(place.len, buf.len);
+    @memcpy(buf[0..n], place[0..n]); // `place` may live in the pane itself
+    try p.open(buf[0..n], null);
+}
+
+fn runQuery(app: *App, p: *Pane, q: []const u8) !void {
+    const lib = app.lib orelse return error.NoLibrary;
+    var qb: [pane_mod.QUERY_MAX]u8 = undefined;
+    const n = @min(q.len, qb.len);
+    @memcpy(qb[0..n], q[0..n]); // `q` may be the pane's own query
+    var found = try lib.find(app.gpa, qb[0..n]);
+    defer found.deinit(app.gpa);
+    try p.showResults(qb[0..n], @ptrCast(found.paths), found.truncated);
 }
 
 fn openStartPanes(app: *App, opts: Options) void {
@@ -408,7 +439,7 @@ fn openStartPanes(app: *App, opts: Options) void {
         for (app.cfg.panes) |maybe| {
             const d = maybe orelse continue;
             if (opened >= config.MAX_PANES) break;
-            app.panes[opened].open(d, null) catch continue;
+            openPlace(app, &app.panes[opened], d) catch continue;
             opened += 1;
         }
         if (opened > 0) app.focus = @min(app.cfg.focus, opened - 1);
@@ -424,7 +455,8 @@ fn openStartPanes(app: *App, opts: Options) void {
 
 fn saveSession(app: *App) void {
     for (0..config.MAX_PANES) |i| {
-        app.cfg.setPane(i, if (i < app.n) app.panes[i].dir() else null);
+        var pb: [PATH_MAX + 8]u8 = undefined;
+        app.cfg.setPane(i, if (i < app.n) placeOf(&app.panes[i], &pb) else null);
     }
     app.cfg.focus = @intCast(app.focus);
     app.cfg.target = if (app.target) |t| @intCast(t + 1) else 0;
@@ -510,8 +542,6 @@ fn playEntry(app: *App, p: *Pane, e: *pane_mod.Entry) void {
     }
     @memcpy(app.play_buf[0..path.len], path);
     app.play_len = path.len;
-    app.play_dir_len = p.dir().len;
-    if (std.mem.endsWith(u8, p.dir(), "/")) app.play_dir_len -|= 1;
     app.play_frames = if (inf) |i| i.frames else 0;
     app.play_rate = if (inf) |i| i.rate else 0;
     if (app.play_frames == 0) app.play_frames = audio.length();
@@ -543,6 +573,8 @@ fn onKey(app: *App, k: Key) void {
         .target => return targetKey(app, k),
         .mkdir => return mkdirKey(app, k),
         .tags => return tagsKey(app, k),
+        .find => return findKey(app, k),
+        .export_confirm => return exportKey(app, k),
         .note => return noteKey(app, k),
         .none => {},
     }
@@ -633,7 +665,14 @@ fn mainKey(app: *App, k: Key) void {
                 'z' => if (app.n > 1) {
                     app.zoom = !app.zoom;
                 },
-                'r' => if (p.reload()) {
+                'r' => if (p.isQuery()) {
+                    var qb: [pane_mod.QUERY_MAX]u8 = undefined;
+                    const q = qb[0..p.query_len];
+                    @memcpy(q, p.query());
+                    if (runQuery(app, p, q)) {
+                        app.setStatus("search again: {d} files", .{p.rows()});
+                    } else |e| app.setStatus("search failed: {s}", .{@errorName(e)});
+                } else if (p.reload()) {
                     app.setStatus("reloaded", .{});
                 } else |e| app.setStatus("reload failed: {s}", .{@errorName(e)}),
                 'T' => cycleTheme(app),
@@ -644,6 +683,9 @@ fn mainKey(app: *App, k: Key) void {
                 'c' => copyKey(app),
                 'M' => openMkdir(app),
                 't' => openTags(app),
+                'f' => openFind(app),
+                'E' => openExport(app),
+                'o' => openFileFolder(app),
                 'x' => armedKey(app),
                 'e' => openNote(app),
                 'C' => openTargetPick(app, false),
@@ -699,6 +741,18 @@ fn activate(app: *App) void {
 
 fn goUp(app: *App) void {
     const p = app.pane();
+    if (p.isQuery()) {
+        // the folder it came from; after a restart that is unknown: the
+        // first library root, else home
+        const back = if (p.back_len > 0)
+            p.backDir()
+        else if (app.lib != null and app.lib.?.roots.items.len > 0)
+            app.lib.?.roots.items[0].path
+        else
+            app.home_buf[0..app.home_len];
+        openPlace(app, p, back) catch |err| app.setStatus("can't open {s}: {s}", .{ back, @errorName(err) });
+        return;
+    }
     const d = p.dir();
     if (std.mem.eql(u8, d, "/")) return;
     var name_buf: [256]u8 = undefined;
@@ -725,6 +779,18 @@ fn newPane(app: *App) void {
         return;
     }
     const src = app.pane();
+    if (src.isQuery()) {
+        var qb: [PATH_MAX + 8]u8 = undefined;
+        const place = placeOf(src, &qb);
+        const np = &app.panes[app.n];
+        np.* = .{ .gpa = app.gpa };
+        openPlace(app, np, place) catch |err| return app.setStatus("new pane failed: {s}", .{@errorName(err)});
+        app.focus = app.n;
+        app.n += 1;
+        app.zoom = false;
+        app.last_cursor = cursorKey(app);
+        return;
+    }
     var dir_buf: [PATH_MAX]u8 = undefined;
     const d = src.dir();
     @memcpy(dir_buf[0..d.len], d);
@@ -770,9 +836,7 @@ fn jumpFavorite(app: *App, slot: usize) void {
         app.setStatus("favorite {d} is empty - F, then s, stores this folder there", .{slot + 1});
         return;
     };
-    var buf: [PATH_MAX]u8 = undefined;
-    @memcpy(buf[0..fav.len], fav);
-    app.pane().open(buf[0..fav.len], null) catch |err| {
+    openPlace(app, app.pane(), fav) catch |err| {
         app.setStatus("favorite {d}: can't open ({s})", .{ slot + 1, @errorName(err) });
         return;
     };
@@ -799,8 +863,9 @@ fn favsKey(app: *App, k: Key) void {
                     jumpFavorite(app, k.sequence[0] - '1');
                 },
                 's' => {
-                    app.cfg.setFavorite(app.fav_sel, app.pane().dir());
-                    app.setStatus("favorite {d} = this folder", .{app.fav_sel + 1});
+                    var pb: [PATH_MAX + 8]u8 = undefined;
+                    app.cfg.setFavorite(app.fav_sel, placeOf(app.pane(), &pb));
+                    app.setStatus("favorite {d} = {s}", .{ app.fav_sel + 1, if (app.pane().isQuery()) "this search" else "this folder" });
                 },
                 'x', 'd' => {
                     app.cfg.setFavorite(app.fav_sel, null);
@@ -837,6 +902,10 @@ fn copyKey(app: *App) void {
 fn copyTo(app: *App, t: usize) void {
     const src = app.pane();
     const dst = &app.panes[t];
+    if (dst.isQuery()) {
+        app.setStatus("pane {d} is a search - copies go into a folder pane", .{t + 1});
+        return;
+    }
     if (std.mem.eql(u8, src.dir(), dst.dir())) {
         app.setStatus("pane {d} shows this same folder - go to the folder to copy into", .{t + 1});
         return;
@@ -980,6 +1049,7 @@ fn targetKey(app: *App, k: Key) void {
 // ------------------------------------------------------------ new folder
 
 fn openMkdir(app: *App) void {
+    if (app.pane().isQuery()) return app.setStatus("a search pane is no folder - backspace goes back to one", .{});
     app.input_len = 0;
     app.modal = .mkdir;
 }
@@ -1217,6 +1287,115 @@ fn armedKey(app: *App) void {
     } else {
         app.setStatus("{s} {s}  {s}", .{ if (all) "-" else "+", tag, p.current().?.name });
         p.move(1); // and on to the next one (AUTO plays it)
+    }
+}
+
+// ------------------------------------------------------------ find
+
+fn openFind(app: *App) void {
+    if (app.lib == null) return app.setStatus("no library - kr8 root add DIR first", .{});
+    const p = app.pane();
+    const q = if (p.isQuery()) p.query() else "";
+    @memcpy(app.input_buf[0..q.len], q);
+    app.input_len = q.len;
+    updateFindCount(app);
+    app.modal = .find;
+}
+
+fn updateFindCount(app: *App) void {
+    const lib = app.lib orelse return;
+    const q = app.input_buf[0..app.input_len];
+    app.find_msg = "";
+    app.find_count = lib.findCount(app.gpa, q) catch |e| blk: {
+        app.find_msg = switch (e) {
+            error.EmptyQuery => "",
+            error.UnknownIs => "unknown is: - see the list below",
+            error.BadLength => "a length is <1s, >2s or <500ms",
+            else => "can't search that",
+        };
+        break :blk -1;
+    };
+}
+
+fn findKey(app: *App, k: Key) void {
+    switch (k.type) {
+        .Escape => app.modal = .none,
+        .Enter => {
+            const q = std.mem.trim(u8, app.input_buf[0..app.input_len], " ");
+            if (q.len == 0) {
+                app.modal = .none;
+                return;
+            }
+            const p = app.pane();
+            runQuery(app, p, q) catch |e| return app.setStatus("search failed: {s}", .{@errorName(e)});
+            app.modal = .none;
+            if (p.truncated) {
+                app.setStatus("{d}+ files - the first {d}; add words to narrow it", .{ p.rows(), library.FIND_LIMIT });
+            } else app.setStatus("{d} files - backspace returns to the folder, o opens a file's folder", .{p.rows()});
+        },
+        else => {
+            editText(&app.input_buf, &app.input_len, k);
+            updateFindCount(app);
+        },
+    }
+}
+
+/// `o` in a search pane: show the cursor file in its folder.
+fn openFileFolder(app: *App) void {
+    const p = app.pane();
+    if (!p.isQuery()) return app.setStatus("o opens a search hit's folder (f searches)", .{});
+    const e = p.current() orelse return;
+    var buf: [PATH_MAX + 1]u8 = undefined;
+    const path = p.pathOf(e, &buf) orelse return;
+    const dir = std.fs.path.dirname(path) orelse return;
+    var nb: [256]u8 = undefined;
+    const base = std.fs.path.basename(path);
+    const n = @min(base.len, nb.len);
+    @memcpy(nb[0..n], base[0..n]);
+    var db: [PATH_MAX]u8 = undefined;
+    @memcpy(db[0..dir.len], dir);
+    p.open(db[0..dir.len], nb[0..n]) catch |err| app.setStatus("can't open {s}: {s}", .{ dir, @errorName(err) });
+    app.last_cursor = cursorKey(app); // same file: AUTO keeps playing it
+}
+
+/// `E`: every file shown in this pane, copied into the target pane.
+fn openExport(app: *App) void {
+    if (app.n < 2) return app.setStatus("export needs a second pane: n opens one - go to the folder to fill", .{});
+    const t = effectiveTarget(app) orelse return openTargetPick(app, false);
+    if (app.panes[t].isQuery()) return app.setStatus("pane {d} is a search - export goes into a folder pane", .{t + 1});
+    const p = app.pane();
+    var n: usize = 0;
+    for (p.view.items) |idx| n += @intFromBool(p.entries.items[idx].isFile());
+    if (n == 0) return app.setStatus("nothing to export here", .{});
+    app.export_n = n;
+    app.export_to = t;
+    app.modal = .export_confirm;
+}
+
+fn exportKey(app: *App, k: Key) void {
+    switch (k.type) {
+        .Escape => app.modal = .none,
+        .Enter => {
+            app.modal = .none;
+            const p = app.pane();
+            const dst = &app.panes[app.export_to];
+            var paths: std.ArrayList([]const u8) = .empty;
+            defer {
+                for (paths.items) |x| app.gpa.free(x);
+                paths.deinit(app.gpa);
+            }
+            var buf: [PATH_MAX + 1]u8 = undefined;
+            for (p.view.items) |idx| {
+                const e = &p.entries.items[idx];
+                if (!e.isFile()) continue;
+                const path = p.pathOf(e, &buf) orelse continue;
+                const owned = app.gpa.dupe(u8, path) catch continue;
+                paths.append(app.gpa, owned) catch app.gpa.free(owned);
+            }
+            app.copier.submit(paths.items, dst.dir()) catch |e| return app.setStatus("export failed: {s}", .{@errorName(e)});
+            app.setStatus("exporting {d} files to pane {d}", .{ paths.items.len, app.export_to + 1 });
+        },
+        else => {},
     }
 }
 

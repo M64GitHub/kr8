@@ -90,12 +90,12 @@ pub fn layout(cols: usize, rows: usize, n: usize, focus: usize, zoom: bool) Layo
     return l;
 }
 
-pub const Modal = enum { none, help, favs, target, mkdir, tags, note };
+pub const Modal = enum { none, help, favs, target, mkdir, tags, note, find, export_confirm };
 
 pub const PlayView = struct {
     active: bool = false,
-    dir: []const u8 = "",
-    name: []const u8 = "",
+    /// the playing file, absolute
+    path: []const u8 = "",
     pos: u64 = 0, // frames
     frames: u64 = 0,
     rate: u32 = 0,
@@ -150,6 +150,11 @@ pub const Ctx = struct {
     tags: TagView,
     /// the note prompt's file name
     note_title: []const u8,
+    /// the find prompt: matches so far (-1 = none / invalid), or the problem
+    find_count: i64,
+    find_msg: []const u8,
+    export_n: usize,
+    export_to: usize,
     cfg: *const config.Config,
     home: []const u8,
 };
@@ -175,7 +180,17 @@ pub fn drawText(c: *TextCanvas, ctx: *const Ctx) void {
         .mkdir => drawMkdir(c, ctx),
         .tags => drawTags(c, ctx),
         .note => drawNote(c, ctx),
+        .find => drawFind(c, ctx),
+        .export_confirm => drawExport(c, ctx),
     }
+}
+
+/// Is `e` (in pane `p`) the file that is playing?
+fn isPlaying(ctx: *const Ctx, p: *const Pane, e: *const Entry) bool {
+    if (!ctx.play.active or e.kind != .audio) return false;
+    var buf: [pane_mod.PATH_MAX + 1]u8 = undefined;
+    const path = p.pathOf(e, &buf) orelse return false;
+    return std.mem.eql(u8, path, ctx.play.path);
 }
 
 fn drawBar(c: *TextCanvas, ctx: *const Ctx) void {
@@ -264,11 +279,21 @@ fn drawPane(c: *TextCanvas, ctx: *const Ctx, p: *Pane, idx: usize, r: Rect) void
         tx += 2;
     }
     var pb: [pane_mod.PATH_MAX + 8]u8 = undefined;
-    const shown = tildePath(p.dir(), ctx.home, &pb);
     const room = r.w -| (tx - r.x + 5);
     c.put(tx, r.y, ' ', theme.text, theme.bg);
-    const n = textTail(c, tx + 1, r.y, shown, room, if (focused) theme.text_bright else theme.text, theme.bg);
-    c.put(tx + 1 + n, r.y, ' ', theme.text, theme.bg);
+    if (p.isQuery()) {
+        // a search: the query, and how many files it found
+        c.putStr(tx + 1, r.y, " ? ", theme.bg, theme.fx_duet);
+        const qn = text(c, tx + 4, r.y, p.query(), room -| 16, theme.text_bright, theme.bg);
+        var cb: [32]u8 = undefined;
+        const cs = std.fmt.bufPrint(&cb, " {d}{s} files ", .{ p.entries.items.len, if (p.truncated) "+" else "" }) catch "";
+        c.put(tx + 4 + qn, r.y, ' ', theme.text, theme.bg);
+        c.putStr(tx + 5 + qn, r.y, cs, theme.text_dim, theme.bg);
+    } else {
+        const shown = tildePath(p.dir(), ctx.home, &pb);
+        const n = textTail(c, tx + 1, r.y, shown, room, if (focused) theme.text_bright else theme.text, theme.bg);
+        c.put(tx + 1 + n, r.y, ' ', theme.text, theme.bg);
+    }
 
     // list
     const inner_w = r.w - 2;
@@ -334,8 +359,7 @@ fn drawRow(c: *TextCanvas, ctx: *const Ctx, p: *Pane, e: *Entry, x0: usize, y: u
     const on_cur = is_cur and focused;
     c.putRepeat(x0, y, w, ' ', theme.text, bg);
 
-    const playing = ctx.play.active and e.kind == .audio and
-        std.mem.eql(u8, ctx.play.name, e.name) and std.mem.eql(u8, ctx.play.dir, p.dir());
+    const playing = isPlaying(ctx, p, e);
     if (playing) c.put(x0, y, 0x25B6, if (on_cur) theme.cursor_fg else theme.accent_pink, bg);
 
     const name_x = x0 + 2;
@@ -395,10 +419,21 @@ fn drawRow(c: *TextCanvas, ctx: *const Ctx, p: *Pane, e: *Entry, x0: usize, y: u
                 }
             }
             const name_room = (rx -| 1) -| name_left;
-            const ext = std.fs.path.extension(e.name);
-            const stem = e.name[0 .. e.name.len - ext.len];
-            const ns = text(c, name_left, y, stem, name_room, if (playing and !on_cur) theme.text_bright else base_fg, bg);
-            if (ns < name_room) _ = text(c, name_left + ns, y, ext, name_room - ns, dim_fg, bg);
+            const shown = p.displayName(e);
+            const ext = std.fs.path.extension(shown);
+            const stem = shown[0 .. shown.len - ext.len];
+            var ns = text(c, name_left, y, stem, name_room, if (playing and !on_cur) theme.text_bright else base_fg, bg);
+            if (ns < name_room) ns += text(c, name_left + ns, y, ext, name_room - ns, dim_fg, bg);
+            if (p.isQuery() and ns + 4 < name_room) {
+                // where the hit lives: relative to its root, else ~-shortened
+                const dir = std.fs.path.dirname(e.name) orelse "";
+                var fb: [pane_mod.PATH_MAX + 8]u8 = undefined;
+                const where = if (ctx.lib) |lib| blk: {
+                    const pl = lib.place(dir);
+                    break :blk if (pl.root_id != 0) pl.path else tildePath(dir, ctx.home, &fb);
+                } else tildePath(dir, ctx.home, &fb);
+                _ = textTail(c, name_left + ns + 2, y, where, name_room - ns - 2, if (on_cur) theme.cursor_fg else theme.value_off, bg);
+            }
         },
     }
 }
@@ -434,7 +469,7 @@ fn drawInfo(c: *TextCanvas, ctx: *const Ctx) void {
             return;
         },
         .other => {
-            x += text(c, x, r.y, e.name, r.w -| 20, theme.text, bg);
+            x += text(c, x, r.y, p.displayName(e), r.w -| 20, theme.text, bg);
             var pb: [pane_mod.PATH_MAX + 1]u8 = undefined;
             const size: ?u64 = if (p.pathOf(e, &pb)) |path|
                 (if (std.fs.cwd().statFile(path)) |st| st.size else |_| null)
@@ -449,8 +484,7 @@ fn drawInfo(c: *TextCanvas, ctx: *const Ctx) void {
     }
 
     // the play readout on the right (when this file is the one playing)
-    const playing_this = ctx.play.active and std.mem.eql(u8, ctx.play.name, e.name) and
-        std.mem.eql(u8, ctx.play.dir, p.dir());
+    const playing_this = isPlaying(ctx, p, e);
     var right_w: usize = 0;
     if (playing_this and ctx.play.rate > 0) {
         var b1: [16]u8 = undefined;
@@ -467,7 +501,7 @@ fn drawInfo(c: *TextCanvas, ctx: *const Ctx) void {
 
     const room = r.w -| (right_w + 2);
     const start = x;
-    x += text(c, x, r.y, e.name, room, theme.text_bright, bg);
+    x += text(c, x, r.y, p.displayName(e), room, theme.text_bright, bg);
     const inf = p.info(e) orelse {
         _ = text(c, x + 2, r.y, "not a readable WAV", room -| (x - start + 2), theme.accent_pink, bg);
         return;
@@ -611,6 +645,54 @@ fn drawTags(c: *TextCanvas, ctx: *const Ctx) void {
     c.putStr(x0 + 2, y0 + h - 1, " enter toggle+arm  tab toggle, stay  shift-tab arm  esc ", theme.text_dim, theme.bg);
 }
 
+const FIND_HELP = [_][]const u8{
+    "words: the path (folders + name), a tag or the note contains it",
+    "-word: none of them    #tag / -#tag: has / lacks the tag",
+    "<1s  >2s  <500ms: length",
+    "is:dupe is:mono is:stereo is:tagged is:untagged is:noted is:loop is:wavetable",
+};
+
+/// The search prompt: the query, the live count, the syntax.
+fn drawFind(c: *TextCanvas, ctx: *const Ctx) void {
+    const w: usize = @min(ctx.lay.cols -| 4, 86);
+    const h: usize = FIND_HELP.len + 7;
+    const x0 = (ctx.lay.cols -| w) / 2;
+    const y0 = (ctx.lay.rows -| h) / 2;
+    widgets.frame(c, x0, y0, w, h, " FIND IN THE LIBRARY ");
+    c.put(x0 + 3, y0 + 2, 0x276F, theme.accent_hot, theme.bg);
+    const n = textTail(c, x0 + 5, y0 + 2, ctx.input, w -| 24, theme.text_bright, theme.bg);
+    c.put(x0 + 5 + n, y0 + 2, 0x2588, theme.accent_hot, theme.bg);
+    var cb: [40]u8 = undefined;
+    const cs = if (ctx.find_msg.len > 0)
+        ctx.find_msg
+    else if (ctx.find_count >= 0)
+        std.fmt.bufPrint(&cb, "{d} files", .{ctx.find_count}) catch ""
+    else
+        "";
+    const col = if (ctx.find_msg.len > 0) theme.accent_pink else theme.fx_duet;
+    if (ctx.find_msg.len > 0) {
+        _ = text(c, x0 + 3, y0 + 3, cs, w -| 6, col, theme.bg);
+    } else c.putStr(x0 + w -| (cs.len + 3), y0 + 2, cs, col, theme.bg);
+    c.putRepeat(x0 + 2, y0 + 4, w - 4, 0x2500, theme.sep, theme.bg);
+    for (FIND_HELP, 0..) |line, i| _ = text(c, x0 + 3, y0 + 5 + i, line, w -| 6, theme.text_dim, theme.bg);
+    c.putStr(x0 + 2, y0 + h - 1, " enter searches (this pane shows the hits)  esc ", theme.text_dim, theme.bg);
+}
+
+fn drawExport(c: *TextCanvas, ctx: *const Ctx) void {
+    const w: usize = @min(ctx.lay.cols -| 4, 76);
+    const h: usize = 6;
+    const x0 = (ctx.lay.cols -| w) / 2;
+    const y0 = (ctx.lay.rows -| h) / 2;
+    widgets.frame(c, x0, y0, w, h, " EXPORT ");
+    var lb: [64]u8 = undefined;
+    const ls = std.fmt.bufPrint(&lb, "copy all {d} files shown here into pane {d}:", .{ ctx.export_n, ctx.export_to + 1 }) catch "";
+    _ = text(c, x0 + 3, y0 + 2, ls, w -| 6, theme.text, theme.bg);
+    var pb: [pane_mod.PATH_MAX + 8]u8 = undefined;
+    if (ctx.export_to < ctx.panes.len)
+        _ = textTail(c, x0 + 3, y0 + 3, tildePath(ctx.panes[ctx.export_to].dir(), ctx.home, &pb), w -| 6, theme.text_bright, theme.bg);
+    c.putStr(x0 + 2, y0 + h - 1, " enter copies (never overwrites)  esc ", theme.text_dim, theme.bg);
+}
+
 /// The one-line note prompt.
 fn drawNote(c: *TextCanvas, ctx: *const Ctx) void {
     const w: usize = @min(ctx.lay.cols -| 4, 90);
@@ -637,7 +719,8 @@ fn drawHints(c: *TextCanvas, ctx: *const Ctx) void {
     const normal = [_]Hint{
         .{ .k = "spc", .v = "play" },   .{ .k = "a", .v = "auto" },
         .{ .k = "L", .v = "loop" },     .{ .k = "/", .v = "filter" },
-        .{ .k = "t", .v = "tag" },      .{ .k = "x", .v = "armed" },
+        .{ .k = "f", .v = "find" },     .{ .k = "t", .v = "tag" },
+        .{ .k = "x", .v = "armed" },
         .{ .k = "c", .v = "copy" },     .{ .k = "v", .v = "mark" },
         .{ .k = "tab", .v = "pane" },   .{ .k = "n", .v = "new pane" },
         .{ .k = "1-8", .v = "favs" },   .{ .k = "?", .v = "help" },
@@ -725,6 +808,18 @@ const HELP = [_]HelpLine{
     note("Tags belong to the SOUND: a copy of the file has the same tags,"),
     note("and they follow it when it moves. Rows: tags in green, \u{00D7}2 = copies,"),
     note("a pilcrow = a note. kr8 root add/list, kr8 scan, kr8 tags on the shell."),
+    .blank,
+    sec("FIND"),
+    key("f", "search the library: this pane shows the hits"),
+    key("  bksp h left", "back to the folder the pane showed before"),
+    key("o", "open the hit's folder (cursor on the file)"),
+    key("E", "export: copy every file shown into the target pane"),
+    key("r", "search again (tags changed since)"),
+    note("Words match the path (folders + name), a tag or the note -"),
+    note("exact, never fuzzy. -word excludes. #good: has the tag good."),
+    note("<1s >2s <500ms: length.  is:dupe is:mono is:stereo is:tagged"),
+    note("is:untagged is:noted is:loop is:wavetable."),
+    note("F then s stores a search as a favorite, like a folder."),
     .blank,
     sec("PANES"),
     key("tab  shift-tab", "next / previous pane"),
@@ -833,7 +928,9 @@ fn drawTargetPick(c: *TextCanvas, ctx: *const Ctx) void {
         c.putRepeat(x0 + 2, y, w - 4, ' ', fg, bg);
         c.put(x0 + 3, y, '1' + @as(u21, @intCast(i)), if (sel) fg else theme.accent_hot, bg);
         var pb: [pane_mod.PATH_MAX + 8]u8 = undefined;
-        _ = textTail(c, x0 + 6, y, tildePath(p.dir(), ctx.home, &pb), w -| 10, fg, bg);
+        if (p.isQuery()) {
+            _ = text(c, x0 + 6, y, "(a search - not a folder)", w -| 10, if (sel) fg else theme.value_off, bg);
+        } else _ = textTail(c, x0 + 6, y, tildePath(p.dir(), ctx.home, &pb), w -| 10, fg, bg);
     }
     c.putStr(x0 + 2, y0 + h - 1, " pane number or enter picks (and is remembered)  esc ", theme.text_dim, theme.bg);
 }
@@ -899,8 +996,7 @@ fn drawWave(c: *TextCanvas, ctx: *const Ctx) void {
         return;
     }
     const inf = p.info(e);
-    const playing_this = ctx.play.active and std.mem.eql(u8, ctx.play.name, e.name) and
-        std.mem.eql(u8, ctx.play.dir, p.dir());
+    const playing_this = isPlaying(ctx, p, e);
     var head: ?usize = null;
     if (playing_this and ctx.play.frames > 0) {
         const t = std.math.clamp(@as(f64, @floatFromInt(ctx.play.pos)) / @as(f64, @floatFromInt(ctx.play.frames)), 0, 1);
