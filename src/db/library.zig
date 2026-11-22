@@ -550,6 +550,20 @@ pub const Library = struct {
         gpa.free(tags);
     }
 
+    /// Give sound `to` every tag of sound `from` (a cut inherits its source's tags).
+    pub fn copyTags(self: *Library, from: i64, to: i64) !void {
+        var q = try self.db.prepare(
+            \\INSERT OR IGNORE INTO sound_tag(sound_id, tag_id, added)
+            \\SELECT ?2, tag_id, ?3 FROM sound_tag WHERE sound_id = ?1
+        );
+        defer q.deinit();
+        try q.bindInt(1, from);
+        try q.bindInt(2, to);
+        try q.bindInt(3, now());
+        try q.run();
+        self.gen +%= 1;
+    }
+
     // ---------------------------------------------------- notes
 
     /// Set the note of a sound; an empty text deletes it.

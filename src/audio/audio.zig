@@ -6,6 +6,11 @@ const std = @import("std");
 extern fn kr8_audio_init() c_int;
 extern fn kr8_audio_uninit() void;
 extern fn kr8_play(path: [*:0]const u8, loop: c_int, loop_start: u64, loop_end: u64) c_int;
+extern fn kr8_play_range(path: [*:0]const u8, loop: c_int, start: u64, end: u64) c_int;
+extern fn kr8_dec_open(path: [*:0]const u8, s16: c_int, channels: *u32, rate: *u32, frames: *u64) ?*anyopaque;
+extern fn kr8_dec_read(d: *anyopaque, out: *anyopaque, frames: u64) u64;
+extern fn kr8_dec_seek(d: *anyopaque, frame: u64) c_int;
+extern fn kr8_dec_close(d: ?*anyopaque) void;
 extern fn kr8_stop() void;
 extern fn kr8_tick() void;
 extern fn kr8_set_loop(loop: c_int) void;
@@ -42,6 +47,50 @@ pub fn play(path: [:0]const u8, loop: bool, span: Loop) bool {
     if (!enabled) return false;
     return kr8_play(path.ptr, @intFromBool(loop), span.start, span.end) == 0;
 }
+
+/// Play frames [start, end) only (LOOP loops that span).
+pub fn playRange(path: [:0]const u8, loop: bool, start: u64, end: u64) bool {
+    if (!enabled) return false;
+    return kr8_play_range(path.ptr, @intFromBool(loop), start, end) == 0;
+}
+
+/// A decoder at the file's own rate and channels: f32 (`s16` false) or
+/// 16-bit samples, interleaved. Usable without an audio device.
+pub const Decoder = struct {
+    h: *anyopaque,
+    channels: u32,
+    rate: u32,
+    frames: u64,
+
+    pub fn open(path: [:0]const u8, s16: bool) !Decoder {
+        var ch: u32 = 0;
+        var rate: u32 = 0;
+        var frames: u64 = 0;
+        const h = kr8_dec_open(path.ptr, @intFromBool(s16), &ch, &rate, &frames) orelse return error.DecodeFailed;
+        if (ch == 0) {
+            kr8_dec_close(h);
+            return error.DecodeFailed;
+        }
+        return .{ .h = h, .channels = ch, .rate = rate, .frames = frames };
+    }
+
+    pub fn close(self: *Decoder) void {
+        kr8_dec_close(self.h);
+    }
+
+    /// Up to `out.len / channels` frames; returns frames read.
+    pub fn readF32(self: *Decoder, out: []f32) u64 {
+        return kr8_dec_read(self.h, out.ptr, out.len / self.channels);
+    }
+
+    pub fn readS16(self: *Decoder, out: []i16) u64 {
+        return kr8_dec_read(self.h, out.ptr, out.len / self.channels);
+    }
+
+    pub fn seek(self: *Decoder, frame: u64) !void {
+        if (kr8_dec_seek(self.h, frame) != 0) return error.SeekFailed;
+    }
+};
 
 pub fn stop() void {
     if (enabled) kr8_stop();

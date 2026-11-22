@@ -19,6 +19,7 @@ const config = @import("config.zig");
 const wav = @import("../audio/wav.zig");
 const peaks_mod = @import("../audio/peaks.zig");
 const library = @import("../db/library.zig");
+const detail_mod = @import("detail.zig");
 
 const Rgb = theme.Rgb;
 const V3 = theme.V3;
@@ -90,7 +91,7 @@ pub fn layout(cols: usize, rows: usize, n: usize, focus: usize, zoom: bool) Layo
     return l;
 }
 
-pub const Modal = enum { none, help, favs, target, mkdir, tags, note, find, export_confirm };
+pub const Modal = enum { none, help, favs, target, mkdir, tags, note, find, export_confirm, write };
 
 pub const PlayView = struct {
     active: bool = false,
@@ -157,6 +158,10 @@ pub const Ctx = struct {
     input_sel: bool,
     export_n: usize,
     export_to: usize,
+    /// the detail view (null: the panes)
+    detail: ?*const detail_mod.Detail,
+    /// where `w` writes
+    write_dir: []const u8,
     cfg: *const config.Config,
     home: []const u8,
 };
@@ -165,13 +170,17 @@ pub const Ctx = struct {
 
 pub fn drawText(c: *TextCanvas, ctx: *const Ctx) void {
     drawBar(c, ctx);
-    for (ctx.panes, 0..) |*p, i| {
-        const r = ctx.lay.panes[i];
-        if (r.w < 8 or r.h < 3) continue;
-        drawPane(c, ctx, p, i, r);
+    if (ctx.detail) |d| {
+        drawDetailText(c, ctx, d);
+    } else {
+        for (ctx.panes, 0..) |*p, i| {
+            const r = ctx.lay.panes[i];
+            if (r.w < 8 or r.h < 3) continue;
+            drawPane(c, ctx, p, i, r);
+        }
+        drawInfo(c, ctx);
+        drawInfo2(c, ctx);
     }
-    drawInfo(c, ctx);
-    drawInfo2(c, ctx);
     drawWave(c, ctx);
     drawHints(c, ctx);
     switch (ctx.modal) {
@@ -184,6 +193,7 @@ pub fn drawText(c: *TextCanvas, ctx: *const Ctx) void {
         .note => drawNote(c, ctx),
         .find => drawFind(c, ctx),
         .export_confirm => drawExport(c, ctx),
+        .write => drawWrite(c, ctx),
     }
 }
 
@@ -727,6 +737,26 @@ const Hint = struct { k: []const u8, v: []const u8 };
 fn drawHints(c: *TextCanvas, ctx: *const Ctx) void {
     const y = ctx.lay.hints.y;
     c.fillRow(y, theme.text_dim, theme.bg);
+    if (ctx.detail != null) {
+        const dh = [_]Hint{
+            .{ .k = "\u{2190}\u{2192}", .v = "move" }, .{ .k = "\u{2191}\u{2193}", .v = "zoom" },
+            .{ .k = "[ ]", .v = "in/out" },    .{ .k = "0", .v = "snap" },
+            .{ .k = "spc", .v = "play" },      .{ .k = "enter", .v = "from cursor" },
+            .{ .k = "L", .v = "loop" },        .{ .k = "z", .v = "fit" },
+            .{ .k = "w", .v = "write" },       .{ .k = "esc", .v = "back" },
+        };
+        var dx: usize = 1;
+        for (dh) |h| {
+            const kn = cellCount(h.k);
+            const need = kn + 1 + h.v.len + 2;
+            if (dx + need > ctx.lay.cols) break;
+            _ = text(c, dx, y, h.k, kn, theme.text, theme.bg);
+            dx += kn + 1;
+            c.putStr(dx, y, h.v, theme.text_dim, theme.bg);
+            dx += h.v.len + 2;
+        }
+        return;
+    }
     const typing = ctx.panes[ctx.focus].typing;
     const normal = [_]Hint{
         .{ .k = "spc", .v = "play" },   .{ .k = "a", .v = "auto" },
@@ -820,6 +850,20 @@ const HELP = [_]HelpLine{
     note("Tags belong to the SOUND: a copy of the file has the same tags,"),
     note("and they follow it when it moves. Rows: tags in green, \u{00D7}2 = copies,"),
     note("a pilcrow = a note. kr8 root add/list, kr8 scan, kr8 tags on the shell."),
+    .blank,
+    sec("DETAIL VIEW"),
+    key("l  right", "on a WAV: open it full screen"),
+    key("  left right", "move the cursor (shift: 10x, h l too, ctrl: half a view)"),
+    key("  up down", "zoom in / out around the cursor (also + - k j)"),
+    key("  [  ]", "range start / end at the cursor (bksp clears it)"),
+    key("  0", "snap the range to zero crossings: no click at the loop"),
+    key("  space", "play the range (or from the cursor) / stop"),
+    key("  enter", "play from the cursor"),
+    key("  z  Z", "fit the range / the whole file"),
+    key("  w", "write the range as a new WAV (tags come along)"),
+    key("  esc  q", "back to the panes"),
+    note("LOOP on + a range = a loop to listen to; moving [ or ] restarts it."),
+    note("The bpm guess reads the range as 1, 2, 4 or 8 bars (or a beat)."),
     .blank,
     sec("FIND"),
     key("f", "search the library: this pane shows the hits"),
@@ -971,11 +1015,210 @@ fn drawFavs(c: *TextCanvas, ctx: *const Ctx) void {
     c.putStr(x0 + 2, y0 + h - 1, " enter/1-8 go  s store this folder  x clear  esc ", theme.text_dim, theme.bg);
 }
 
+// ============================================================ detail view
+
+/// The detail view's frame: the waveform's box (its inside is left
+/// transparent - the pixel layer draws there) and the time ruler.
+pub fn detailRect(lay: *const Layout) Rect {
+    return .{ .x = 0, .y = 1, .w = lay.cols, .h = lay.info.y -| 1 };
+}
+
+fn drawDetailText(c: *TextCanvas, ctx: *const Ctx, d: *const detail_mod.Detail) void {
+    const r = detailRect(ctx.lay);
+    if (r.h < 6) return;
+    const bord = theme.accent_hot;
+    // the box: edges only, the inside stays see-through
+    c.putRepeat(r.x + 1, r.y, r.w - 2, 0x2500, bord, theme.bg);
+    c.putRepeat(r.x + 1, r.y + r.h - 1, r.w - 2, 0x2500, bord, theme.bg);
+    var yy = r.y + 1;
+    while (yy + 1 < r.y + r.h) : (yy += 1) {
+        c.put(r.x, yy, 0x2502, bord, theme.bg);
+        c.put(r.x + r.w - 1, yy, 0x2502, bord, theme.bg);
+    }
+    c.put(r.x, r.y, 0x256D, bord, theme.bg);
+    c.put(r.x + r.w - 1, r.y, 0x256E, bord, theme.bg);
+    c.put(r.x, r.y + r.h - 1, 0x2570, bord, theme.bg);
+    c.put(r.x + r.w - 1, r.y + r.h - 1, 0x256F, bord, theme.bg);
+    // title
+    var tb: [200]u8 = undefined;
+    const zoomx = @as(f64, @floatFromInt(@max(d.frames, 1))) / @as(f64, @floatFromInt(@max(d.view_len, 1)));
+    const chans: []const u8 = if (d.channels == 1) "mono" else if (d.channels == 2) "stereo" else "multi";
+    c.putStr(r.x + 2, r.y, " DETAIL ", theme.focus_fg, theme.focus_bg);
+    c.put(r.x + 10, r.y, ' ', theme.text, theme.bg);
+    var tx = r.x + 11;
+    tx += text(c, tx, r.y, d.name(), r.w / 2, theme.text_bright, theme.bg);
+    const ts = std.fmt.bufPrint(&tb, "  {d:.1}k {s} {d:.3} s  zoom \u{00D7}{d:.1} ", .{
+        @as(f64, @floatFromInt(d.rate)) / 1000.0, chans, d.secs(d.frames), zoomx,
+    }) catch "";
+    _ = text(c, tx, r.y, ts, r.w -| (tx + 3), theme.text_dim, theme.bg);
+
+    // the ruler: second from the bottom row of the box
+    const ry = r.y + r.h - 2;
+    const inner = r.w - 2;
+    c.putRepeat(r.x + 1, ry, inner, ' ', theme.text_dim, theme.bg);
+    const span = d.secs(d.view_len);
+    const steps = [_]f64{ 0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60 };
+    var step: f64 = steps[steps.len - 1];
+    for (steps) |st| {
+        if (span / st * 14.0 <= @as(f64, @floatFromInt(inner))) {
+            step = st;
+            break;
+        }
+    }
+    const t0 = d.secs(d.view_start);
+    var t = @ceil(t0 / step) * step;
+    while (t <= t0 + span) : (t += step) {
+        const col: usize = @intFromFloat((t - t0) / span * @as(f64, @floatFromInt(inner)));
+        if (col >= inner) break;
+        c.put(r.x + 1 + col, ry, 0x2575, theme.sep, theme.bg); // ╵
+        var lb: [24]u8 = undefined;
+        const dec: usize = if (step >= 1) 0 else if (step >= 0.1) 1 else if (step >= 0.01) 2 else 3;
+        const ls = switch (dec) {
+            0 => std.fmt.bufPrint(&lb, "{d:.0}", .{t}),
+            1 => std.fmt.bufPrint(&lb, "{d:.1}", .{t}),
+            2 => std.fmt.bufPrint(&lb, "{d:.2}", .{t}),
+            else => std.fmt.bufPrint(&lb, "{d:.3}", .{t}),
+        } catch "";
+        if (col + 2 + ls.len < inner) c.putStr(r.x + 2 + col, ry, ls, theme.text_dim, theme.bg);
+    }
+
+    // the two info rows: where you are, and the range
+    const bg = theme.header_bg;
+    const iy = ctx.lay.info.y;
+    c.fillRow(iy, theme.text, bg);
+    var ib: [160]u8 = undefined;
+    const is = std.fmt.bufPrint(&ib, "cursor {d:.3} s   view {d:.3} - {d:.3} s", .{
+        d.secs(d.cursor), d.secs(d.view_start), d.secs(d.view_start + d.view_len),
+    }) catch "";
+    _ = text(c, 1, iy, is, ctx.lay.cols -| 30, theme.text, bg);
+    if (ctx.play.active and std.mem.eql(u8, ctx.play.path, d.path()) and d.rate > 0) {
+        var pb2: [40]u8 = undefined;
+        const ps = std.fmt.bufPrint(&pb2, "{d:.3} s", .{d.secs(ctx.play.pos)}) catch "";
+        c.put(ctx.lay.cols -| (ps.len + 3), iy, 0x25B6, theme.accent_pink, bg);
+        c.putStr(ctx.lay.cols -| (ps.len + 1), iy, ps, theme.text_bright, bg);
+    }
+    const iy2 = ctx.lay.info2.y;
+    c.fillRow(iy2, theme.text, bg);
+    if (d.range()) |rg| {
+        var rb: [200]u8 = undefined;
+        var tmp: [80]u8 = undefined;
+        const tempo = if (d.tempo()) |tp| (std.fmt.bufPrint(&tmp, "   \u{2248} {s} @ {d:.1} bpm", .{ tp.label, tp.bpm }) catch "") else "";
+        const rs = std.fmt.bufPrint(&rb, "range {d:.3} - {d:.3} s   length {d:.3} s{s}", .{
+            d.secs(rg.in), d.secs(rg.out), d.secs(rg.out - rg.in), tempo,
+        }) catch "";
+        _ = text(c, 1, iy2, rs, ctx.lay.cols -| 2, theme.fx_duet, bg);
+    } else {
+        _ = text(c, 1, iy2, "no range - [ marks the start at the cursor, ] the end", ctx.lay.cols -| 2, theme.text_dim, bg);
+    }
+}
+
+/// The big waveform on the pixel layer: glow, range wash, markers,
+/// cursor, playhead (its glow trails behind it).
+fn drawDetailPixels(f: *movy.Frame, ctx: *const Ctx, d: *const detail_mod.Detail) void {
+    const r = detailRect(ctx.lay);
+    if (r.h < 6 or r.w < 8) return;
+    const px: i32 = @intCast(r.x + 1);
+    const py: i32 = @intCast((r.y + 1) * 2);
+    const pw: i32 = @intCast(r.w - 2);
+    const ph: i32 = @intCast((r.h - 3) * 2);
+    f.rect(px, py, pw, ph, theme.WAVE_SLOT);
+    const vs = d.view_start;
+    const vl = @max(d.view_len, 1);
+    const colOf = struct {
+        fn at(frame: u64, s: u64, l: u64, w: i32) i32 {
+            if (frame < s) return -1;
+            const rel = @as(f64, @floatFromInt(frame - s)) / @as(f64, @floatFromInt(l));
+            return @intFromFloat(rel * @as(f64, @floatFromInt(w)));
+        }
+    }.at;
+    // the range: a wash, and its two ends
+    const rg = d.range();
+    if (rg) |x| {
+        const c0 = std.math.clamp(colOf(x.in, vs, vl, pw), 0, pw);
+        const c1 = std.math.clamp(colOf(x.out, vs, vl, pw), 0, pw);
+        if (c1 > c0) f.rect(px + c0, py, c1 - c0, ph, theme.WAVE_LOOP_BG);
+    }
+    const mid: f32 = @as(f32, @floatFromInt(py)) + @as(f32, @floatFromInt(ph)) / 2.0 - 0.5;
+    const half: f32 = @as(f32, @floatFromInt(ph)) / 2.0 - 1.0;
+    f.hline(px, @intFromFloat(@round(mid)), pw, theme.WAVE_BASE);
+    const gain: f32 = if (d.peak > 0.0001) 1.0 / d.peak else 1.0;
+    const dim = theme.mixV3(theme.VIZ_SCOPE, theme.WAVE_SLOT, 0.55);
+    var prev_y: ?i32 = null;
+    var x: i32 = 0;
+    while (x < pw) : (x += 1) {
+        const f0: u64 = vs + @as(u64, @intCast(x)) * vl / @as(u64, @intCast(pw));
+        var f1: u64 = vs + @as(u64, @intCast(x + 1)) * vl / @as(u64, @intCast(pw));
+        if (f0 >= d.mono.len) break;
+        if (f1 <= f0) f1 = f0 + 1;
+        f1 = @min(f1, d.mono.len);
+        var lo: f32 = d.mono[f0];
+        var hi: f32 = d.mono[f0];
+        for (d.mono[f0..f1]) |v| {
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        var yt: i32 = @intFromFloat(@floor(mid - hi * gain * half));
+        var yb: i32 = @intFromFloat(@ceil(mid - lo * gain * half));
+        // zoomed past one frame per column: join the dots
+        if (f1 - f0 <= 1) {
+            if (prev_y) |p| {
+                yt = @min(yt, p);
+                yb = @max(yb, p);
+            }
+            prev_y = @intFromFloat(@round(mid - d.mono[f0] * gain * half));
+        }
+        const inside = if (rg) |q| (f0 >= q.in and f0 < q.out) else true;
+        const col = if (inside) theme.VIZ_SCOPE else dim;
+        f.vline(px + x, yt, @max(1, yb - yt + 1), col);
+        if (inside) f.gvline(px + x, yt, @max(1, yb - yt + 1), theme.VIZ_SCOPE_GLOW.scale(0.06));
+    }
+    if (rg) |q| {
+        for ([_]u64{ q.in, q.out }) |m| {
+            const c = colOf(m, vs, vl, pw);
+            if (c < 0 or c >= pw) continue;
+            f.vline(px + c, py, ph, theme.WAVE_MARK);
+            f.gvline(px + c, py, ph, theme.WAVE_MARK.scale(0.25));
+        }
+    }
+    // the edit cursor: a plain bright hairline
+    const cc = colOf(d.cursor, vs, vl, pw);
+    if (cc >= 0 and cc < pw) f.vline(px + cc, py, ph, theme.WAVE_SEAM.scale(0.75));
+    // the playhead: pink, glowing (the glow buffer leaves a trail)
+    if (ctx.play.active and std.mem.eql(u8, ctx.play.path, d.path())) {
+        const hc = colOf(ctx.play.pos, vs, vl, pw);
+        if (hc >= 0 and hc < pw) {
+            f.vline(px + hc, py, ph, theme.LOGO_PINK);
+            f.gvline(px + hc, py, ph, theme.LOGO_PINK.scale(0.5));
+        }
+    }
+}
+
+fn drawWrite(c: *TextCanvas, ctx: *const Ctx) void {
+    const d = ctx.detail orelse return;
+    const rg = d.range() orelse return;
+    const w: usize = @min(ctx.lay.cols -| 4, 80);
+    const h: usize = 7;
+    const x0 = (ctx.lay.cols -| w) / 2;
+    const y0 = (ctx.lay.rows -| h) / 2;
+    widgets.frame(c, x0, y0, w, h, " WRITE THE RANGE ");
+    var lb: [120]u8 = undefined;
+    const ls = std.fmt.bufPrint(&lb, "{d:.3} s, {d} ch, 16-bit WAV into", .{ d.secs(rg.out - rg.in), d.channels }) catch "";
+    _ = text(c, x0 + 3, y0 + 2, ls, w -| 6, theme.text, theme.bg);
+    var pb: [pane_mod.PATH_MAX + 8]u8 = undefined;
+    _ = textTail(c, x0 + 3, y0 + 3, tildePath(ctx.write_dir, ctx.home, &pb), w -| 6, theme.text_bright, theme.bg);
+    c.put(x0 + 3, y0 + 4, 0x276F, theme.accent_hot, theme.bg);
+    const qfg = if (ctx.input_sel) theme.cursor_fg else theme.text_bright;
+    const qbg = if (ctx.input_sel) theme.cursor_bg else theme.bg;
+    const n = text(c, x0 + 5, y0 + 4, ctx.input, w -| 14, qfg, qbg);
+    c.putStr(x0 + 5 + n, y0 + 4, ".wav", theme.text_dim, theme.bg);
+    c.putStr(x0 + 2, y0 + h - 1, " enter writes (tags come along)  esc ", theme.text_dim, theme.bg);
+}
+
 // ================================================================= pixels
 
 pub fn drawPixels(f: *movy.Frame, ctx: *const Ctx) void {
-    _ = ctx;
     f.rect(0, 0, f.w, f.h, V3.fromRgb(theme.bg));
+    if (ctx.detail) |d| drawDetailPixels(f, ctx, d);
 }
 
 /// Display curve: >1 is linear-ish, <1 lifts quiet detail (a break's
@@ -1039,7 +1282,14 @@ fn drawWave(c: *TextCanvas, ctx: *const Ctx) void {
         const up: usize = @max(1, @as(usize, @intFromFloat(@round(std.math.pow(f32, @min(1, hi * gain), WAVE_GAMMA) * steps))));
         const dn: usize = @max(1, @as(usize, @intFromFloat(@round(std.math.pow(f32, @min(1, -lo * gain), WAVE_GAMMA) * steps))));
         const in_loop = x >= loop_x0 and x < loop_x1;
-        const gnd = if (in_loop) loop_ground else ground;
+        const in_view = if (ctx.detail) |dv| blk: {
+            const tot: f64 = @floatFromInt(@max(dv.frames, 1));
+            const fw: f64 = @floatFromInt(r.w);
+            const v0: usize = @intFromFloat(@as(f64, @floatFromInt(dv.view_start)) / tot * fw);
+            const v1: usize = @intFromFloat(@ceil(@as(f64, @floatFromInt(dv.view_start + dv.view_len)) / tot * fw));
+            break :blk x >= v0 and x < @max(v1, v0 + 1);
+        } else false;
+        const gnd = if (in_view) theme.mix(ground, theme.accent, 0.22) else if (in_loop) loop_ground else ground;
         const ink = if (head) |h| (if (x == h) theme.accent_pink else if (x < h) theme.accent_hot else theme.text_dim) else theme.accent;
         // upper half: row k above the zero line holds eighths 8k+1 .. 8k+8
         var k: usize = 0;

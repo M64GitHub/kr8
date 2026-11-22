@@ -131,6 +131,7 @@ test {
     _ = @import("audio/audio.zig");
     _ = @import("app/pane.zig");
     _ = @import("app/copier.zig");
+    _ = @import("app/detail.zig");
     _ = @import("db/library.zig");
     _ = @import("app/view.zig");
     _ = @import("app/ui/motion.zig");

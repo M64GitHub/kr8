@@ -33,8 +33,9 @@
 
 typedef struct {
     ma_sound sound;
-    int live;     /* initialised: must be uninit'ed */
-    int retiring; /* fading out after a stop */
+    int live;           /* initialised: must be uninit'ed */
+    int retiring;       /* fading out after a stop */
+    uint64_t range_beg; /* a range was set: miniaudio's cursor is relative to it */
 } Voice;
 
 static ma_resource_manager g_rm;
@@ -106,12 +107,11 @@ void kr8_stop(void)
     g_cur = -1;
 }
 
-int kr8_play(const char *path, int loop, uint64_t loop_start, uint64_t loop_end)
+/* A fresh voice streaming `path` (the previous one fades out). */
+static Voice *voice_new(const char *path, int *slot_out)
 {
     int slot;
     Voice *v;
-    if (!g_engine_ok)
-        return -1;
     kr8_stop();
     /* the slot that is NOT fading; if both are busy, cut the older fade */
     slot = g_voice[0].live ? 1 : 0;
@@ -120,18 +120,56 @@ int kr8_play(const char *path, int loop, uint64_t loop_start, uint64_t loop_end)
     if (ma_sound_init_from_file(&g_engine, path,
                                 MA_SOUND_FLAG_STREAM | MA_SOUND_FLAG_NO_SPATIALIZATION,
                                 NULL, NULL, &v->sound) != MA_SUCCESS)
-        return -2;
+        return NULL;
     v->live = 1;
-    if (loop_end > loop_start)
-        ma_data_source_set_loop_point_in_pcm_frames(ma_sound_get_data_source(&v->sound),
-                                                    loop_start, loop_end);
-    ma_sound_set_looping(&v->sound, loop ? MA_TRUE : MA_FALSE);
+    v->range_beg = 0;
+    *slot_out = slot;
+    return v;
+}
+
+static int voice_start(Voice *v, int slot)
+{
     if (ma_sound_start(&v->sound) != MA_SUCCESS) {
         voice_free(v);
         return -3;
     }
     g_cur = slot;
     return 0;
+}
+
+/* Play only frames [start, end) of `path` (the detail view's range, or
+ * "from the cursor to the end"); LOOP loops that span. */
+int kr8_play_range(const char *path, int loop, uint64_t start, uint64_t end)
+{
+    int slot;
+    Voice *v;
+    if (!g_engine_ok)
+        return -1;
+    v = voice_new(path, &slot);
+    if (!v)
+        return -2;
+    if (end > start) {
+        ma_data_source_set_range_in_pcm_frames(ma_sound_get_data_source(&v->sound), start, end);
+        v->range_beg = start;
+    }
+    ma_sound_set_looping(&v->sound, loop ? MA_TRUE : MA_FALSE);
+    return voice_start(v, slot);
+}
+
+int kr8_play(const char *path, int loop, uint64_t loop_start, uint64_t loop_end)
+{
+    int slot;
+    Voice *v;
+    if (!g_engine_ok)
+        return -1;
+    v = voice_new(path, &slot);
+    if (!v)
+        return -2;
+    if (loop_end > loop_start)
+        ma_data_source_set_loop_point_in_pcm_frames(ma_sound_get_data_source(&v->sound),
+                                                    loop_start, loop_end);
+    ma_sound_set_looping(&v->sound, loop ? MA_TRUE : MA_FALSE);
+    return voice_start(v, slot);
 }
 
 void kr8_tick(void)
@@ -164,9 +202,10 @@ int kr8_is_playing(void)
 uint64_t kr8_cursor(void)
 {
     ma_uint64 c = 0;
-    if (g_cur >= 0)
-        ma_sound_get_cursor_in_pcm_frames(&g_voice[g_cur].sound, &c);
-    return c;
+    if (g_cur < 0)
+        return 0;
+    ma_sound_get_cursor_in_pcm_frames(&g_voice[g_cur].sound, &c);
+    return c + g_voice[g_cur].range_beg; /* absolute, in the file's frames */
 }
 
 uint64_t kr8_length(void)
@@ -181,6 +220,48 @@ void kr8_set_volume(float v)
 {
     if (g_engine_ok)
         ma_engine_set_volume(&g_engine, v);
+}
+
+/* -------------------------------------------------------------- decoder */
+
+/* A plain decoder for the detail view (f32) and for writing ranges (s16):
+ * the file's own rate and channels. */
+void *kr8_dec_open(const char *path, int s16, uint32_t *channels, uint32_t *rate, uint64_t *frames)
+{
+    ma_decoder_config cfg = ma_decoder_config_init(s16 ? ma_format_s16 : ma_format_f32, 0, 0);
+    ma_decoder *d = (ma_decoder *)malloc(sizeof(ma_decoder));
+    ma_uint64 n = 0;
+    if (!d)
+        return NULL;
+    if (ma_decoder_init_file(path, &cfg, d) != MA_SUCCESS) {
+        free(d);
+        return NULL;
+    }
+    ma_decoder_get_length_in_pcm_frames(d, &n);
+    *channels = d->outputChannels;
+    *rate = d->outputSampleRate;
+    *frames = n;
+    return d;
+}
+
+uint64_t kr8_dec_read(void *d, void *out, uint64_t frames)
+{
+    ma_uint64 got = 0;
+    ma_decoder_read_pcm_frames((ma_decoder *)d, out, frames, &got);
+    return got;
+}
+
+int kr8_dec_seek(void *d, uint64_t frame)
+{
+    return ma_decoder_seek_to_pcm_frame((ma_decoder *)d, frame) == MA_SUCCESS ? 0 : -1;
+}
+
+void kr8_dec_close(void *d)
+{
+    if (!d)
+        return;
+    ma_decoder_uninit((ma_decoder *)d);
+    free(d);
 }
 
 /* ---------------------------------------------------------------- peaks */

@@ -5,8 +5,8 @@ browser for a tracker live set (2× M8, Game Boy/LSDj, DUET). Browse, audition w
 find across folders, copy into a set, cut loops out of long samples. Zig 0.15.2 on movy (v0.3.1,
 pinned like qartz). macOS first; keep Linux building (bbox).
 
-Status (2026-11-22): **steps 1-4 built** (browse + listen, copy, the library, find): `kr8 [DIR...]`,
-linked as `~/bin/kr8`. Next: step 5 (the detail view: waveform zoom, range, loop, write WAV).
+Status (2026-11-22): **steps 1-5 built** (browse + listen, copy, the library, find, the detail
+view): `kr8 [DIR...]`, linked as `~/bin/kr8`. Next: step 6 (the extras pool).
 
 ## 1. The library (scanned 2026-11-22)
 
@@ -159,7 +159,7 @@ note      (sound_id PRIMARY KEY, text, updated)
   are kept even without files (`is:lost`), so tags come back when a drive is plugged in again.
 - Tagging a file outside every root indexes that file alone.
 
-## 8. Detail view (`Enter` on a file; full screen; `Esc` back)
+## 8. Detail view (`l` / right on a file; full screen; `Esc` back) - built, see step 5
 
 Big zoomable waveform with playhead. `[` `]` set in/out, `SPC` plays the range, `L` loops it,
 `+ -` zoom, `0` snaps in/out to zero crossings, `w` writes the range (suggested `name_01.wav`, into
@@ -206,7 +206,16 @@ the target pane's folder; tags copied). Shows range length and a BPM guess for 1
    copy destination. Also fixed: miniaudio's resource manager decoded at the DEVICE rate, so the
    playhead/readout ran 9 % fast on 44.1 kHz files at a 48 kHz Mac (and smpl loop points would have
    been off) - now it decodes at the file's own rate (regression test in audio.zig).
-5. **Detail view**: waveform zoom, range, snap, loop, write WAV.
+5. ~~**Detail view**: waveform zoom, range, snap, loop, write WAV.~~ Done 2026-11-22. `l` / right on
+   a WAV opens it (ENTER stays "replay": m64 uses it); esc / q goes back. The file is decoded into a
+   mono mix (draw + zero crossings; max ~11 min); the waveform is the movy pixel layer (glow, range
+   wash, pink in/out markers, white cursor, glowing playhead trail; scanlines softened to 0.9). Keys:
+   arrows move (shift 10x, ctrl half a view), up/down zoom around the cursor, `[` `]` range, `0`
+   snaps to zero crossings, space plays the range (miniaudio data-source range, sample-exact; LOOP
+   loops it; moving an end while it plays restarts it), enter plays from the cursor, `z`/`Z` fit,
+   `w` writes the range as 16-bit WAV (target pane's folder, else next to the source; `_cutNN`,
+   never overwrites) and the cut inherits the source's tags. Readout: range, length, bpm guess
+   (1/2/4/8 bars or a beat landing in 70-190). Measured while looping: kr8 5 %, kitty 12 % (30 fps).
 6. Later: BPM from names, `kr8 find|export` CLI, `.pti` preview, LSDj kit builder, M8 slice points.
 
 ## 11. Open questions

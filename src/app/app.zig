@@ -34,6 +34,7 @@ const peaks_mod = @import("../audio/peaks.zig");
 const copier_mod = @import("copier.zig");
 const library = @import("../db/library.zig");
 const scanner_mod = @import("../db/scanner.zig");
+const detail_mod = @import("detail.zig");
 
 const Pane = pane_mod.Pane;
 const Key = movy.input.Key;
@@ -41,6 +42,8 @@ const PATH_MAX = pane_mod.PATH_MAX;
 
 const FRAME_NS: i128 = std.time.ns_per_s / 60;
 const STATUS_FRAMES: u64 = 60 * 4;
+/// movy's odd-row darkening (1 = none)
+const SCANLINE: f32 = 0.9;
 
 pub const Options = struct {
     headless: bool = false,
@@ -132,6 +135,15 @@ const App = struct {
     /// the pre-filled query is SELECTED: typing replaces it (m64 typed
     /// is:stereo after a search for is:mono and got "is:mono is:stereo")
     input_sel: bool = false,
+    // ---- the detail view (step 5): one file, full screen
+    detail: ?*detail_mod.Detail = null,
+    /// its waveform's width in columns, as last drawn (cursor steps)
+    detail_w: usize = 100,
+    /// the glow buffer holds an old waveform: wipe it (leaving the view)
+    clear_glow: bool = false,
+    /// where `w` writes, while the name is typed
+    write_dir: [PATH_MAX]u8 = undefined,
+    write_dir_len: usize = 0,
     // the export confirmation
     export_n: usize = 0,
     export_to: usize = 0,
@@ -194,6 +206,8 @@ const App = struct {
     }
 
     fn deinit(self: *App) void {
+        if (self.detail) |d| d.deinit();
+        self.detail = null;
         for (self.panes[0..self.n]) |*p| p.deinit();
         library.Library.freeTags(self.gpa, self.tag_rows);
         self.tag_rows = &.{};
@@ -265,6 +279,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
     var frame = try movy.Frame.init(gpa, @intCast(cols), @intCast(rows * 2));
     defer frame.deinit();
     frame.setVignette(0);
+    frame.scanline_mul = SCANLINE; // a hint of CRT, not stripes through the waveform
     var canvas = try canvas_mod.TextCanvas.init(gpa, cols, rows);
     defer canvas.deinit();
 
@@ -291,6 +306,7 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
                     const nframe = try movy.Frame.init(gpa, @intCast(sz.cols), @intCast(sz.rows * 2));
                     errdefer nframe.deinit();
                     nframe.setVignette(0);
+                    nframe.scanline_mul = SCANLINE;
                     var ncanvas = try canvas_mod.TextCanvas.init(gpa, sz.cols, sz.rows);
                     errdefer ncanvas.deinit();
                     try t.applyResize(gpa, sz.cols, sz.rows);
@@ -310,13 +326,20 @@ pub fn run(gpa: std.mem.Allocator, opts: Options) !u8 {
 
         app.cols = cols;
         app.rows = rows;
+        if (app.clear_glow) {
+            @memset(frame.glow, .{ .r = 0, .g = 0, .b = 0 });
+            app.clear_glow = false;
+            pix_dirty = true;
+        }
         const lay = view.layout(cols, rows, app.n, app.focus, app.zoom);
+        app.detail_w = cols -| 2;
         app.page_rows = lay.panes[app.focus].h -| 3;
 
         if (app.status() != null or app.frame_no < app.anim_until or app.frame_no % 60 == 0) app.dirty = true;
         if (app.dirty or term == null) {
             app.dirty = false;
             const ctx = viewCtx(&app, &lay);
+            if (app.detail != null) pix_dirty = true; // the big waveform lives on the pixel layer
             if (pix_dirty) {
                 frame.beginFrame();
                 view.drawPixels(frame, &ctx);
@@ -397,6 +420,8 @@ fn viewCtx(app: *App, lay: *const view.Layout) view.Ctx {
         .input_sel = app.input_sel,
         .find_msg = app.find_msg,
         .export_n = app.export_n,
+        .detail = app.detail,
+        .write_dir = app.write_dir[0..app.write_dir_len],
         .export_to = app.export_to,
         .cfg = app.cfg,
         .home = app.home_buf[0..app.home_len],
@@ -478,7 +503,8 @@ fn afterKeys(app: *App) void {
         app.playing = false;
         app.dirty = true;
     }
-    // the playhead moves: 30 fps is smooth for it, and halves the terminal's work
+    // the playhead moves: 30 fps is smooth for it, and halves the terminal's
+    // work (the detail view's glowing waveform cost kitty 20 % at 60)
     if (app.playing and app.frame_no % 2 == 0) app.dirty = true;
 
     // AUTO: the cursor moved to another file since the last frame
@@ -579,9 +605,11 @@ fn onKey(app: *App, k: Key) void {
         .tags => return tagsKey(app, k),
         .find => return findKey(app, k),
         .export_confirm => return exportKey(app, k),
+        .write => return writeKey(app, k),
         .note => return noteKey(app, k),
         .none => {},
     }
+    if (app.detail != null) return detailKey(app, k);
     if (app.pane().typing) return filterKey(app, k);
     mainKey(app, k);
 }
@@ -622,7 +650,8 @@ fn mainKey(app: *App, k: Key) void {
         .PageDown => p.move(pageRows(app)),
         .Home => p.home(),
         .End => p.end(),
-        .Enter, .Right => activate(app),
+        .Enter => activate(app),
+        .Right => enterInto(app),
         .Backspace, .Left => goUp(app),
         .Tab => cycleFocus(app, true),
         .ShiftTab => cycleFocus(app, false),
@@ -641,7 +670,7 @@ fn mainKey(app: *App, k: Key) void {
                 'k' => p.move(-1),
                 'g' => p.home(),
                 'G' => p.end(),
-                'l' => activate(app),
+                'l' => enterInto(app),
                 'h' => goUp(app),
                 ' ' => togglePlay(app),
                 'a' => {
@@ -1294,6 +1323,212 @@ fn armedKey(app: *App) void {
     }
 }
 
+// ------------------------------------------------------------ detail view
+
+/// `l` / right: into a folder, or into a WAV (the detail view).
+fn enterInto(app: *App) void {
+    const p = app.pane();
+    const e = p.current() orelse return;
+    if (e.kind != .audio) return activate(app);
+    var buf: [PATH_MAX + 1]u8 = undefined;
+    const path = p.pathOf(e, &buf) orelse return;
+    const d = detail_mod.Detail.load(app.gpa, path) catch |err| {
+        return app.setStatus("can't open {s}: {s}", .{ e.name, switch (err) {
+            error.TooLong => "longer than ~11 minutes",
+            else => @errorName(err),
+        } });
+    };
+    // keep the playhead if this very file is playing
+    if (app.playing and std.mem.eql(u8, app.playPath(), path)) d.setCursor(audio.cursor());
+    app.detail = d;
+    app.clear_glow = true;
+    app.setStatus("[ ] set in/out, space plays, 0 snaps, w writes the range - esc goes back", .{});
+}
+
+fn closeDetail(app: *App) void {
+    const d = app.detail orelse return;
+    d.deinit();
+    app.detail = null;
+    app.clear_glow = true;
+}
+
+/// Play the range, or from the cursor to the end.
+fn playDetail(app: *App, from_cursor: bool) void {
+    const d = app.detail orelse return;
+    if (!audio.enabled) return app.setStatus("no audio device", .{});
+    var start = d.cursor;
+    var end = d.frames;
+    if (!from_cursor) if (d.range()) |r| {
+        start = r.in;
+        end = r.out;
+    };
+    if (!audio.playRange(d.path(), app.cfg.loop, start, end)) return app.setStatus("can't play {s}", .{d.name()});
+    const p = d.path();
+    @memcpy(app.play_buf[0..p.len], p);
+    app.play_len = p.len;
+    app.play_frames = d.frames;
+    app.play_rate = d.rate;
+    app.playing = true;
+}
+
+/// After the range moved: a playing range starts over with the new ends.
+fn replayIfRange(app: *App) void {
+    const d = app.detail orelse return;
+    if (app.playing and d.range() != null) playDetail(app, false);
+}
+
+fn detailKey(app: *App, k: Key) void {
+    const d = app.detail orelse return;
+    const w = app.detail_w;
+    app.anim_until = app.frame_no + 40; // let the glow settle
+    switch (k.type) {
+        .Escape => closeDetail(app),
+        .Left => d.moveCursor(-1, w),
+        .Right => d.moveCursor(1, w),
+        .ShiftLeft => d.moveCursor(-10, w),
+        .ShiftRight => d.moveCursor(10, w),
+        .CtrlLeft => d.moveCursor(-@as(i64, @intCast(w / 2)), w),
+        .CtrlRight => d.moveCursor(@intCast(w / 2), w),
+        .Home => d.setCursor(d.view_start),
+        .End => d.setCursor(d.view_start + d.view_len -| 1),
+        .Up => d.zoom(0.5, @max(w / 4, 8)),
+        .Down => d.zoom(2.0, @max(w / 4, 8)),
+        .Enter => playDetail(app, true),
+        .Backspace => {
+            d.clearRange();
+            app.setStatus("range cleared", .{});
+        },
+        .Char => {
+            if (k.sequence.len != 1) return;
+            switch (k.sequence[0]) {
+                'q' => closeDetail(app),
+                'h' => d.moveCursor(-10, w),
+                'l' => d.moveCursor(10, w),
+                'k', '+', '=' => d.zoom(0.5, @max(w / 4, 8)),
+                'j', '-' => d.zoom(2.0, @max(w / 4, 8)),
+                'z' => d.fitRange(),
+                'Z' => d.fitAll(),
+                '[' => {
+                    d.setIn();
+                    replayIfRange(app);
+                },
+                ']' => {
+                    d.setOut();
+                    replayIfRange(app);
+                },
+                '0' => {
+                    if (d.snapRange()) {
+                        app.setStatus("range snapped to zero crossings", .{});
+                        replayIfRange(app);
+                    } else app.setStatus("set a range first: [ and ]", .{});
+                },
+                ' ' => if (app.playing) stop(app) else playDetail(app, false),
+                'L' => {
+                    app.cfg.loop = !app.cfg.loop;
+                    app.cfg.save();
+                    audio.setLoop(app.cfg.loop);
+                    app.setStatus("LOOP {s}", .{if (app.cfg.loop) "on" else "off"});
+                },
+                'w' => openWrite(app),
+                '?' => {
+                    app.modal = .help;
+                    app.help_scroll = 0;
+                },
+                'T' => cycleTheme(app),
+                else => {},
+            }
+        },
+        else => {},
+    }
+}
+
+/// `w`: name the range's new file - into the target pane's folder when
+/// there is one, else next to the source.
+fn openWrite(app: *App) void {
+    const d = app.detail orelse return;
+    if (d.range() == null) return app.setStatus("set a range first: [ at the start, ] at the end", .{});
+    var dir: []const u8 = std.fs.path.dirname(d.path()) orelse "/";
+    if (effectiveTarget(app)) |t| if (!app.panes[t].isQuery()) {
+        dir = app.panes[t].dir();
+    };
+    @memcpy(app.write_dir[0..dir.len], dir);
+    app.write_dir_len = dir.len;
+    // the first free <stem>_cutNN
+    const src = d.name();
+    const stem = src[0 .. src.len - std.fs.path.extension(src).len];
+    var dd = std.fs.openDirAbsolute(dir, .{}) catch return app.setStatus("can't open {s}", .{dir});
+    defer dd.close();
+    var i: u32 = 1;
+    while (i < 1000) : (i += 1) {
+        var nb: [300]u8 = undefined;
+        const cand = std.fmt.bufPrint(&nb, "{s}_cut{d:0>2}.wav", .{ stem, i }) catch return;
+        dd.access(cand, .{}) catch {
+            const shown = cand[0 .. cand.len - 4];
+            const n = @min(shown.len, app.input_buf.len);
+            @memcpy(app.input_buf[0..n], shown[0..n]);
+            app.input_len = n;
+            break;
+        };
+    }
+    app.input_sel = true;
+    app.modal = .write;
+}
+
+fn writeKey(app: *App, k: Key) void {
+    switch (k.type) {
+        .Escape => app.modal = .none,
+        .Enter => writeRange(app),
+        .Right, .End => app.input_sel = false,
+        else => {
+            if (app.input_sel) {
+                app.input_sel = false;
+                if (k.type == .Char or k.type == .Backspace) app.input_len = 0;
+                if (k.type == .Backspace) return;
+            }
+            editText(&app.input_buf, &app.input_len, k);
+        },
+    }
+}
+
+fn writeRange(app: *App) void {
+    const d = app.detail orelse return;
+    const r = d.range() orelse return;
+    var name = std.mem.trim(u8, app.input_buf[0..app.input_len], " ");
+    if (name.len == 0) return;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return app.setStatus("a file name can't contain /", .{});
+    var nb: [300]u8 = undefined;
+    if (!std.ascii.eqlIgnoreCase(std.fs.path.extension(name), ".wav"))
+        name = std.fmt.bufPrint(&nb, "{s}.wav", .{name}) catch return;
+    const dir = app.write_dir[0..app.write_dir_len];
+    var pb: [PATH_MAX + 1]u8 = undefined;
+    const dst = std.fmt.bufPrint(&pb, "{s}/{s}", .{ dir, name }) catch return;
+    _ = detail_mod.writeRange(d.path(), dst, r.in, r.out) catch |e| {
+        return app.setStatus("{s}", .{switch (e) {
+            error.PathAlreadyExists => "that name exists already - kr8 never overwrites, pick another",
+            else => @errorName(e),
+        }});
+    };
+    app.modal = .none;
+    // the cut inherits the source's tags
+    var tagged = false;
+    if (app.lib) |lib| {
+        if (lib.ensureSound(d.path())) |from| {
+            if (lib.ensureSound(dst)) |to| {
+                lib.copyTags(from, to) catch {};
+                tagged = true;
+            } else |_| {}
+        } else |_| {}
+    }
+    // panes on that folder show the new file
+    for (app.panes[0..app.n], 0..) |*p, i| {
+        if (!std.mem.eql(u8, p.dir(), dir)) continue;
+        p.reload() catch continue;
+        if (i != app.focus) _ = p.select(name);
+    }
+    var tb: [PATH_MAX + 8]u8 = undefined;
+    app.setStatus("wrote {s} ({d:.3} s{s}) into {s}", .{ name, d.secs(r.out - r.in), if (tagged) ", tags copied" else "", view.tildePath(dir, app.home_buf[0..app.home_len], &tb) });
+}
+
 // ------------------------------------------------------------ find
 
 fn openFind(app: *App) void {
@@ -1506,6 +1741,8 @@ fn scriptedKeys(app: *App, script: []const u8) void {
             .{ "tab", .Tab, "" },       .{ "stab", .ShiftTab, "" }, .{ "bksp", .Backspace, "" },
             .{ "space", .Char, " " },   .{ "pgup", .PageUp, "" },  .{ "pgdn", .PageDown, "" },
             .{ "home", .Home, "" },     .{ "end", .End, "" },      .{ "f7", .F7, "" },
+            .{ "sleft", .ShiftLeft, "" }, .{ "sright", .ShiftRight, "" }, .{ "cleft", .CtrlLeft, "" },
+            .{ "cright", .CtrlRight, "" },
         };
         var done = false;
         for (named) |nk| {

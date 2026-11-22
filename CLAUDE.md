@@ -14,6 +14,9 @@ the library facts and the build order.
   eighth-block waveform, help page, overlays), `config.zig` (`~/.config/kr8/config.zon`,
   `KR8_HOME`), `copier.zig` (the copy worker thread: never overwrites, `_2` names; headless runs
   `waitIdle()` each frame so dumps are deterministic).
+- `src/app/detail.zig`: the detail view's model (mono mix, view/zoom, cursor, range, zero-crossing
+  snap, bpm guess, `writeRange`). The audio shim's `kr8_play_range` reports ABSOLUTE frames
+  (miniaudio's cursor is relative to a range); `Decoder` reads f32/s16 at the file's own rate.
 - `src/db/`: `sqlite.zig` (+ `sqlite_shim.c`), `library.zig` (schema, roots + absorb, Indexer,
   lookups/Facts, tags, notes), `scanner.zig` (thread + `scanAll`). `src/cli.zig`: `root`/`scan`/`tags`.
 - Lifted from qartz (from DUET): `term.zig`, `event.zig`, `ui/canvas.zig`, `ui/widgets.zig`,
